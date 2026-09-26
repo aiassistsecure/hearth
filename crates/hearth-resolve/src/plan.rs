@@ -541,13 +541,34 @@ mod safetensors_tests {
 
     fn files() -> Vec<RepoFile> {
         vec![
-            RepoFile { path: "config.json".into(), size_bytes: Some(100) },
-            RepoFile { path: "tokenizer.json".into(), size_bytes: Some(200) },
-            RepoFile { path: "model.safetensors.index.json".into(), size_bytes: Some(50) },
-            RepoFile { path: "model-00001-of-00002.safetensors".into(), size_bytes: Some(10) },
-            RepoFile { path: "model-00002-of-00002.safetensors".into(), size_bytes: Some(11) },
-            RepoFile { path: "adapter_model.safetensors".into(), size_bytes: Some(1) },
-            RepoFile { path: "README.md".into(), size_bytes: Some(1) },
+            RepoFile {
+                path: "config.json".into(),
+                size_bytes: Some(100),
+            },
+            RepoFile {
+                path: "tokenizer.json".into(),
+                size_bytes: Some(200),
+            },
+            RepoFile {
+                path: "model.safetensors.index.json".into(),
+                size_bytes: Some(50),
+            },
+            RepoFile {
+                path: "model-00001-of-00002.safetensors".into(),
+                size_bytes: Some(10),
+            },
+            RepoFile {
+                path: "model-00002-of-00002.safetensors".into(),
+                size_bytes: Some(11),
+            },
+            RepoFile {
+                path: "adapter_model.safetensors".into(),
+                size_bytes: Some(1),
+            },
+            RepoFile {
+                path: "README.md".into(),
+                size_bytes: Some(1),
+            },
         ]
     }
 
