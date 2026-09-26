@@ -318,6 +318,52 @@ fn default_binary() -> Result<std::path::PathBuf, String> {
 }
 
 fn cmd_runtime(args: &[String]) -> Result<(), String> {
+    let target = args
+        .iter()
+        .find(|a| !a.starts_with("--"))
+        .map(String::as_str)
+        .unwrap_or("all");
+
+    match target {
+        "all" => {
+            install_llama_runtime(args)?;
+            install_vllm_runtime(args)?;
+            Ok(())
+        }
+        "llama" | "llama.cpp" => install_llama_runtime(args),
+        "vllm" => install_vllm_runtime(args),
+        other => Err(format!(
+            "unknown runtime {other:?}; use: hearth runtime [all|llama|vllm] [--force]"
+        )),
+    }
+}
+
+/// Resolve the vLLM CLI for safetensors serving.
+/// Order: HEARTH_VLLM > PATH > the isolated runtime installed by hearth runtime.
+fn default_vllm_binary() -> Result<std::path::PathBuf, String> {
+    use hearth_pull::runtime as rt;
+
+    let on_path = std::process::Command::new("vllm")
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    match rt::resolve_vllm(&hearth_home(), on_path) {
+        rt::Resolved::Explicit(p) => Ok(p),
+        rt::Resolved::OnPath => Ok("vllm".into()),
+        rt::Resolved::Fetched(p) => Ok(p),
+        rt::Resolved::Missing => Err(
+            "no vLLM runtime found. Run `hearth runtime` to install HEARTH's managed vLLM environment, or set HEARTH_VLLM to an existing vllm CLI."
+                .into(),
+        ),
+    }
+}
+
+fn install_llama_runtime(args: &[String]) -> Result<(), String> {
     use hearth_pull::runtime as rt;
 
     let plat = rt::Platform::detect();
@@ -458,6 +504,100 @@ fn cmd_runtime(args: &[String]) -> Result<(), String> {
         }
     }
     println!("  `hearth up` and `hearth serve` will use it automatically.");
+    Ok(())
+}
+
+fn install_vllm_runtime(args: &[String]) -> Result<(), String> {
+    use hearth_pull::runtime as rt;
+
+    let home = hearth_home();
+    let dir = rt::vllm_dir(&home);
+    let force = args.iter().any(|a| a == "--force");
+
+    if let Some(existing) = rt::fetched_vllm(&home) {
+        if !force {
+            println!("vLLM runtime already installed at {}", existing.display());
+            println!("  (re-install with: hearth runtime vllm --force)");
+            return Ok(());
+        }
+        std::fs::remove_dir_all(&dir)
+            .map_err(|e| format!("removing old vLLM runtime {}: {e}", dir.display()))?;
+    }
+
+    if !cfg!(target_os = "linux") {
+        return Err(
+            "HEARTH-managed vLLM is currently supported on Linux; set HEARTH_VLLM to a working vllm CLI on this platform"
+                .into(),
+        );
+    }
+
+    let python = ["python3", "python"]
+        .into_iter()
+        .find(|name| {
+            std::process::Command::new(name)
+                .arg("--version")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        })
+        .ok_or("python3 is required to install HEARTH's managed vLLM runtime")?;
+
+    if let Some(parent) = dir.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    eprintln!(
+        "hearth: creating isolated vLLM runtime at {} …",
+        dir.display()
+    );
+    let status = std::process::Command::new(python)
+        .args(["-m", "venv"])
+        .arg(&dir)
+        .status()
+        .map_err(|e| format!("could not create vLLM virtualenv with {python}: {e}"))?;
+    if !status.success() {
+        return Err(format!(
+            "{python} -m venv failed — install the Python venv module for this interpreter"
+        ));
+    }
+
+    let python_bin = dir.join("bin").join("python");
+    eprintln!("hearth: installing vLLM into the isolated runtime …");
+    let status = std::process::Command::new(&python_bin)
+        .args(["-m", "pip", "install", "--upgrade", "vllm"])
+        .status()
+        .map_err(|e| format!("could not run pip for vLLM: {e}"))?;
+    if !status.success() {
+        return Err("installing vLLM into HEARTH's isolated runtime failed".into());
+    }
+
+    let vllm = rt::fetched_vllm(&home).ok_or_else(|| {
+        format!(
+            "vLLM installed, but its CLI was not found under {}",
+            dir.display()
+        )
+    })?;
+    let ver = std::process::Command::new(&vllm)
+        .arg("--version")
+        .output()
+        .map_err(|e| format!("vLLM installed but could not be executed: {e}"))?;
+    if !ver.status.success() {
+        return Err(format!(
+            "vLLM installed but --version failed: {}",
+            first_line(String::from_utf8_lossy(&ver.stderr).trim())
+        ));
+    }
+
+    let shown = if ver.stdout.is_empty() {
+        String::from_utf8_lossy(&ver.stderr)
+    } else {
+        String::from_utf8_lossy(&ver.stdout)
+    };
+    println!("vLLM runtime ready: {}", vllm.display());
+    println!("  {}", first_line(shown.trim()));
+    println!("  HEARTH will use it automatically for safetensors models.");
     Ok(())
 }
 
@@ -1109,7 +1249,7 @@ fn cmd_serve(args: &[String]) -> Result<(), String> {
     spec.ctx = ctx;
     spec.binary = match flag(args, "--binary") {
         Some(b) => b.into(),
-        None if is_safetensors => "vllm".into(),
+        None if is_safetensors => default_vllm_binary()?,
         None => default_binary()?,
     };
     spec.log_dir = hearth_home().join("logs");
@@ -1117,7 +1257,7 @@ fn cmd_serve(args: &[String]) -> Result<(), String> {
 
     if !runtime_available(&spec.binary) {
         let hint = if is_safetensors {
-            "install vLLM (the `vllm` CLI) or pass --binary"
+            "run `hearth runtime vllm` to install HEARTH's managed vLLM runtime or pass --binary"
         } else {
             "install llama.cpp or pass --binary"
         };
