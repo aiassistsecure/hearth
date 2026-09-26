@@ -354,8 +354,7 @@ fn post_local_json(port: u16, path: &str, body: &str) -> Result<String, String> 
         .map_err(|e| format!("write: {e}"))?;
 
     let mut buf = Vec::new();
-    s.read_to_end(&mut buf)
-        .map_err(|e| format!("read: {e}"))?;
+    s.read_to_end(&mut buf).map_err(|e| format!("read: {e}"))?;
 
     let raw = String::from_utf8_lossy(&buf);
     let (head, body) = raw
@@ -1451,10 +1450,8 @@ fn cmd_up(args: &[String]) -> Result<(), String> {
             "  preload: {} model(s) will be warmed as they turn resident",
             warm_list.len()
         );
-        let warm_backends: std::collections::HashMap<String, Backend> = specs
-            .iter()
-            .map(|s| (s.name.clone(), s.backend))
-            .collect();
+        let warm_backends: std::collections::HashMap<String, Backend> =
+            specs.iter().map(|s| (s.name.clone(), s.backend)).collect();
         let warmer = Arc::clone(&sup);
         std::thread::spawn(move || {
             for model in warm_list {
