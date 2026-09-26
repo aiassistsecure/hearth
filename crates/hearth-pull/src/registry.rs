@@ -644,13 +644,20 @@ mod tests {
         let f = resolve_blobs(&r).unwrap();
 
         assert_eq!(f.format, plan::ModelFormat::SafeTensors);
-        assert!(f.weights_bytes > 0, "live repo reported no safetensors weight bytes");
         assert!(
-            f.blobs.iter().any(|b| b.is_weights && b.name.ends_with(".safetensors")),
+            f.weights_bytes > 0,
+            "live repo reported no safetensors weight bytes"
+        );
+        assert!(
+            f.blobs
+                .iter()
+                .any(|b| b.is_weights && b.name.ends_with(".safetensors")),
             "live repo resolved no safetensors weights"
         );
         assert!(
-            f.blobs.iter().any(|b| b.name == "config.json" && !b.is_weights),
+            f.blobs
+                .iter()
+                .any(|b| b.name == "config.json" && !b.is_weights),
             "live repo resolved without config.json"
         );
         assert!(
@@ -663,9 +670,9 @@ mod tests {
             "live repo resolved without tokenizer metadata"
         );
         assert!(
-            f.blobs
-                .iter()
-                .all(|b| b.url.starts_with("https://huggingface.co/Interchained/imagine-v8/resolve/")),
+            f.blobs.iter().all(|b| b
+                .url
+                .starts_with("https://huggingface.co/Interchained/imagine-v8/resolve/")),
             "resolved blob URL escaped the requested Hugging Face repo"
         );
     }
