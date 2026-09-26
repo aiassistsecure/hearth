@@ -141,7 +141,6 @@ pub fn fetched_server(hearth_home: &Path) -> Option<PathBuf> {
     None
 }
 
-
 /// Where hearth keeps its isolated vLLM environment.
 pub fn vllm_dir(hearth_home: &Path) -> PathBuf {
     runtime_dir(hearth_home).join("vllm")
@@ -325,7 +324,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn vllm_resolution_finds_hearths_managed_environment() {
         let _env = env_guard();
@@ -354,9 +352,6 @@ mod tests {
         std::env::set_var("HEARTH_VLLM", "/opt/vllm/bin/vllm");
         let r = resolve_vllm(Path::new("/nowhere"), true);
         std::env::remove_var("HEARTH_VLLM");
-        assert_eq!(
-            r,
-            Resolved::Explicit(PathBuf::from("/opt/vllm/bin/vllm"))
-        );
+        assert_eq!(r, Resolved::Explicit(PathBuf::from("/opt/vllm/bin/vllm")));
     }
 }
