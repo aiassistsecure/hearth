@@ -460,11 +460,20 @@ fn install_llama_runtime(args: &[String]) -> Result<(), String> {
                 continue;
             }
             let to = bin_dir.join(entry.file_name());
-            if std::fs::rename(entry.path(), &to).is_ok() {
-                moved += 1;
+            if to.exists() {
+                std::fs::remove_file(&to).map_err(|e| {
+                    format!("removing stale runtime file {}: {e}", to.display())
+                })?;
             }
+            std::fs::copy(entry.path(), &to).map_err(|e| {
+                format!(
+                    "copying runtime file {} to {}: {e}",
+                    entry.path().display(),
+                    to.display()
+                )
+            })?;
+            moved += 1;
         }
-        let _ = std::fs::remove_dir_all(&src);
     }
     let server = bin_dir.join(server_name);
     if !server.exists() {
