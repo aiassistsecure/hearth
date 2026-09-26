@@ -637,6 +637,39 @@ mod tests {
             .any(|b| b.name == "model.safetensors" && b.is_weights));
     }
 
+    #[test]
+    #[ignore = "live Hugging Face smoke test; run explicitly in manual CI"]
+    fn live_imagine_v8_resolves_as_safetensors_without_downloading_weights() {
+        let r = Reference::parse("hf:Interchained/imagine-v8").unwrap();
+        let f = resolve_blobs(&r).unwrap();
+
+        assert_eq!(f.format, plan::ModelFormat::SafeTensors);
+        assert!(f.weights_bytes > 0, "live repo reported no safetensors weight bytes");
+        assert!(
+            f.blobs.iter().any(|b| b.is_weights && b.name.ends_with(".safetensors")),
+            "live repo resolved no safetensors weights"
+        );
+        assert!(
+            f.blobs.iter().any(|b| b.name == "config.json" && !b.is_weights),
+            "live repo resolved without config.json"
+        );
+        assert!(
+            f.blobs.iter().any(|b| {
+                matches!(
+                    b.name.as_str(),
+                    "tokenizer.json" | "tokenizer.model" | "tokenizer_config.json"
+                ) && !b.is_weights
+            }),
+            "live repo resolved without tokenizer metadata"
+        );
+        assert!(
+            f.blobs
+                .iter()
+                .all(|b| b.url.starts_with("https://huggingface.co/Interchained/imagine-v8/resolve/")),
+            "resolved blob URL escaped the requested Hugging Face repo"
+        );
+    }
+
     // ---- Reference::Url, the third source alongside Ollama and HuggingFace --
 
     #[test]
