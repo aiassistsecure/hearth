@@ -14,7 +14,7 @@ authors.workspace = true
 
 [dependencies]
 hearth-core = { path = "../hearth-core", version = "0.4.7" }
-nedb-engine = "2.8"
+nedb-engine = "10.30.93"
 serde = { workspace = true }
 serde_json = { workspace = true }
 
