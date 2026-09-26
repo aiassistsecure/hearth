@@ -1285,12 +1285,12 @@ fn cmd_up(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// `--model NAME=/path/to.gguf` or `--model NAME=/path/to.gguf:20` (GiB).
+/// `--model NAME=[gguf:|safetensors:]PATH[:GIB][@CTX]`.
 ///
 /// The size is what the budget plans against. Without it we guess 4 GiB, which
 /// is deliberately conservative: over-guessing refuses models that would fit,
 /// and that is a worse failure than admitting one that is slightly tight.
-/// `--model NAME=/path/to.gguf[:GIB][@CTX]`
+/// GGUF remains the default when no backend prefix is present.
 ///
 /// PER-MODEL CONTEXT, BECAUSE ONE GLOBAL `--ctx` IS THE WRONG SHAPE.
 ///
@@ -1719,6 +1719,7 @@ mod model_spec_tests {
         assert_eq!(out[0].path, "/blobs/sha256-27cd");
         assert_eq!(out[0].gib, 12);
         assert_eq!(out[0].ctx, Some(32768));
+        assert_eq!(out[0].backend, super::Backend::LlamaCpp);
     }
 
     #[test]
@@ -1769,6 +1770,24 @@ mod model_spec_tests {
         assert_eq!(out[0].ctx, Some(65536));
         assert_eq!(out[1].ctx, None, "inherits the global default");
         assert_eq!(out[2].ctx, Some(32768));
+    }
+
+    #[test]
+    fn explicit_gguf_prefix_keeps_llama_backend() {
+        let out = m("muse=gguf:/models/muse.gguf:7@8192");
+        assert_eq!(out[0].backend, super::Backend::LlamaCpp);
+        assert_eq!(out[0].path, "/models/muse.gguf");
+        assert_eq!(out[0].gib, 7);
+        assert_eq!(out[0].ctx, Some(8192));
+    }
+
+    #[test]
+    fn safetensors_prefix_selects_vllm_and_preserves_windows_paths() {
+        let out = m(r"imagine=safetensors:C:\models\Interchained_imagine-v8:3@16384");
+        assert_eq!(out[0].backend, super::Backend::Vllm);
+        assert_eq!(out[0].path, r"C:\models\Interchained_imagine-v8");
+        assert_eq!(out[0].gib, 3);
+        assert_eq!(out[0].ctx, Some(16384));
     }
 
     #[test]
