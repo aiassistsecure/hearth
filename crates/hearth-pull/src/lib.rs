@@ -788,7 +788,6 @@ mod tests {
     }
 }
 
-
 #[cfg(test)]
 mod safetensors_package_tests {
     use super::*;
@@ -811,15 +810,15 @@ mod safetensors_package_tests {
         };
         let dir = materialize_safetensors_package(
             "Interchained/imagine-v8",
-            &[
-                ("model.safetensors".into(), a),
-                ("config.json".into(), b),
-            ],
+            &[("model.safetensors".into(), a), ("config.json".into(), b)],
             &cfg,
         )
         .unwrap();
 
-        assert_eq!(std::fs::read(dir.join("model.safetensors")).unwrap(), b"weights");
+        assert_eq!(
+            std::fs::read(dir.join("model.safetensors")).unwrap(),
+            b"weights"
+        );
         assert_eq!(std::fs::read(dir.join("config.json")).unwrap(), b"config");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -831,13 +830,13 @@ mod safetensors_package_tests {
         std::fs::create_dir_all(&blobs).unwrap();
         let src = blobs.join("a");
         std::fs::write(&src, b"x").unwrap();
-        let cfg = PullConfig { blobs_dir: blobs, progress: false, verify_existing: false };
-        let err = materialize_safetensors_package(
-            "m",
-            &[("../escape".into(), src)],
-            &cfg,
-        )
-        .unwrap_err();
+        let cfg = PullConfig {
+            blobs_dir: blobs,
+            progress: false,
+            verify_existing: false,
+        };
+        let err =
+            materialize_safetensors_package("m", &[("../escape".into(), src)], &cfg).unwrap_err();
         assert!(err.contains("unsafe model path"));
         let _ = std::fs::remove_dir_all(&root);
     }
