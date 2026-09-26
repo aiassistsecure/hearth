@@ -8,13 +8,24 @@
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
+/// Runtime backend selected for one supervised model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backend {
+    /// GGUF via llama.cpp's llama-server.
+    LlamaCpp,
+    /// Hugging Face safetensors directory via vLLM's OpenAI-compatible server.
+    Vllm,
+}
+
 /// Everything needed to start one model's serving child.
 #[derive(Debug, Clone)]
 pub struct ServerSpec {
     /// Model name as declared ("muse", "llama3:latest").
     pub model: String,
-    /// Path to the GGUF on disk.
+    /// Runtime-facing model path: GGUF file for llama.cpp, model directory for vLLM.
     pub gguf: PathBuf,
+    /// Backend that owns inference for this child.
+    pub backend: Backend,
     /// Port to serve on.
     pub port: u16,
     /// The llama-server binary. Default: "llama-server" on PATH.
@@ -68,6 +79,7 @@ impl ServerSpec {
         ServerSpec {
             model: model.into(),
             gguf: gguf.into(),
+            backend: Backend::LlamaCpp,
             port,
             binary: PathBuf::from("llama-server"),
             ctx: 0,
@@ -80,6 +92,20 @@ impl ServerSpec {
         }
     }
 
+    /// Construct a vLLM-backed safetensors model.
+    pub fn new_safetensors(
+        model: impl Into<String>,
+        model_dir: impl Into<PathBuf>,
+        port: u16,
+    ) -> ServerSpec {
+        let mut spec = ServerSpec::new(model, model_dir, port);
+        spec.backend = Backend::Vllm;
+        spec.binary = PathBuf::from("vllm");
+        spec.parallel = 0;
+        spec.cont_batching = false;
+        spec
+    }
+
     pub fn endpoint(&self) -> String {
         format!("127.0.0.1:{}", self.port)
     }
@@ -87,38 +113,56 @@ impl ServerSpec {
     /// The argv we will actually run — pure, so tests can assert it without
     /// spawning anything.
     pub fn argv(&self) -> Vec<String> {
-        let mut args = vec![
-            "-m".to_string(),
-            self.gguf.display().to_string(),
-            "--host".to_string(),
-            "127.0.0.1".to_string(),
-            "--port".to_string(),
-            self.port.to_string(),
-        ];
-        if self.ctx > 0 {
-            args.push("-c".to_string());
-            args.push(self.ctx.to_string());
-        }
-        // All layers on the GPU unless told otherwise. llama.cpp defaults to 0
-        // — CPU — and a 20 GiB model quietly running on CPU reads as broken
-        // hardware, not as a missing flag.
-        args.push("--n-gpu-layers".to_string());
-        args.push(match self.gpu_layers {
-            Some(n) => n.to_string(),
-            None => "-1".to_string(),
-        });
-        if self.parallel > 0 {
-            args.push("--parallel".to_string());
-            args.push(self.parallel.to_string());
-        }
-        // Continuous batching is what makes extra slots serve concurrent
-        // callers rather than just queue them differently.
-        if self.cont_batching && self.parallel > 1 {
-            args.push("--cont-batching".to_string());
-        }
-        if self.mlock {
-            args.push("--mlock".to_string());
-        }
+        let mut args = match self.backend {
+            Backend::LlamaCpp => {
+                let mut args = vec![
+                    "-m".to_string(),
+                    self.gguf.display().to_string(),
+                    "--host".to_string(),
+                    "127.0.0.1".to_string(),
+                    "--port".to_string(),
+                    self.port.to_string(),
+                ];
+                if self.ctx > 0 {
+                    args.push("-c".to_string());
+                    args.push(self.ctx.to_string());
+                }
+                // All layers on the GPU unless told otherwise. llama.cpp defaults to 0.
+                args.push("--n-gpu-layers".to_string());
+                args.push(match self.gpu_layers {
+                    Some(n) => n.to_string(),
+                    None => "-1".to_string(),
+                });
+                if self.parallel > 0 {
+                    args.push("--parallel".to_string());
+                    args.push(self.parallel.to_string());
+                }
+                if self.cont_batching && self.parallel > 1 {
+                    args.push("--cont-batching".to_string());
+                }
+                if self.mlock {
+                    args.push("--mlock".to_string());
+                }
+                args
+            }
+            Backend::Vllm => {
+                let mut args = vec![
+                    "serve".to_string(),
+                    self.gguf.display().to_string(),
+                    "--host".to_string(),
+                    "127.0.0.1".to_string(),
+                    "--port".to_string(),
+                    self.port.to_string(),
+                    "--served-model-name".to_string(),
+                    self.model.clone(),
+                ];
+                if self.ctx > 0 {
+                    args.push("--max-model-len".to_string());
+                    args.push(self.ctx.to_string());
+                }
+                args
+            }
+        };
         // Caller's args go LAST so an operator can override any default above.
         args.extend(self.extra_args.iter().cloned());
         args
@@ -148,12 +192,10 @@ pub struct ServerChild {
 }
 
 impl ServerChild {
-    /// Spawn the child. Fails fast if the GGUF is missing — a child that
-    /// starts and then dies on a bad path wastes a whole probe cycle to
-    /// learn what a stat call knew for free.
+    /// Spawn the child. Fails fast if the model path is missing.
     pub fn spawn(spec: ServerSpec) -> Result<ServerChild, String> {
         if !spec.gguf.exists() {
-            return Err(format!("gguf not found: {}", spec.gguf.display()));
+            return Err(format!("model path not found: {}", spec.gguf.display()));
         }
         let stdout =
             std::fs::File::create(spec.log_path("out")).map_err(|e| format!("log file: {e}"))?;
@@ -279,6 +321,27 @@ mod tests {
     }
 
     #[test]
+    fn vllm_argv_serves_a_safetensors_directory() {
+        let mut spec = ServerSpec::new_safetensors("imagine", "/models/imagine-v8", 9000);
+        spec.ctx = 8192;
+        assert_eq!(
+            spec.argv(),
+            vec![
+                "serve",
+                "/models/imagine-v8",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "9000",
+                "--served-model-name",
+                "imagine",
+                "--max-model-len",
+                "8192"
+            ]
+        );
+    }
+
+    #[test]
     fn zero_ctx_means_no_flag() {
         let spec = ServerSpec::new("muse", "/models/muse.gguf", 8080);
         assert!(!spec.argv().contains(&"-c".to_string()));
@@ -299,7 +362,7 @@ mod tests {
             Err(e) => e,
             Ok(_) => panic!("spawn succeeded on a missing gguf"),
         };
-        assert!(err.contains("gguf not found"), "{err}");
+        assert!(err.contains("model path not found"), "{err}");
     }
 
     #[test]
