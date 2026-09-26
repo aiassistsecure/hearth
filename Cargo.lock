@@ -731,9 +731,9 @@ dependencies = [
 
 [[package]]
 name = "nedb-engine"
-version = "2.8.2"
+version = "10.30.93"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "33a6bd640c1c4d821134e6dbeef41a2c3d87c4ee4f53d6c9061cbd486a037834"
+checksum = "40626862571b893719cb2ea8c02392268548d6aec79de977194db82d60359270"
 dependencies = [
  "aes-gcm",
  "anyhow",
