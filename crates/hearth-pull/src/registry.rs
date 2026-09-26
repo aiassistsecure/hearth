@@ -215,9 +215,7 @@ fn blobs_from_hf_listing(
             );
         }
     } else if format == plan::ModelFormat::SafeTensors {
-        eprintln!(
-            "hearth: {owner}/{repo} has no GGUF — selected native safetensors package"
-        );
+        eprintln!("hearth: {owner}/{repo} has no GGUF — selected native safetensors package");
     }
 
     let mut blobs = Vec::with_capacity(parts.len());
@@ -621,12 +619,22 @@ mod tests {
                 "lfs": { "oid": "CCCC000000000000000000000000000000000000000000000000000000CCCC" }
             }
         ]);
-        let f = blobs_from_hf_listing(&listing, "Interchained", "imagine-v8", "main", None).unwrap();
+        let f =
+            blobs_from_hf_listing(&listing, "Interchained", "imagine-v8", "main", None).unwrap();
         assert_eq!(f.format, plan::ModelFormat::SafeTensors);
         assert_eq!(f.weights_bytes, 16_000_000_000);
-        assert!(f.blobs.iter().any(|b| b.name == "config.json" && !b.is_weights));
-        assert!(f.blobs.iter().any(|b| b.name == "tokenizer.json" && !b.is_weights));
-        assert!(f.blobs.iter().any(|b| b.name == "model.safetensors" && b.is_weights));
+        assert!(f
+            .blobs
+            .iter()
+            .any(|b| b.name == "config.json" && !b.is_weights));
+        assert!(f
+            .blobs
+            .iter()
+            .any(|b| b.name == "tokenizer.json" && !b.is_weights));
+        assert!(f
+            .blobs
+            .iter()
+            .any(|b| b.name == "model.safetensors" && b.is_weights));
     }
 
     // ---- Reference::Url, the third source alongside Ollama and HuggingFace --
