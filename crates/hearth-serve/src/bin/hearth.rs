@@ -502,6 +502,18 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::
     Ok(())
 }
 
+fn find_venv_python(venv: &std::path::Path) -> Option<std::path::PathBuf> {
+    [
+        venv.join("Scripts").join("python.exe"),
+        venv.join("Scripts").join("python"),
+        venv.join("bin").join("python.exe"),
+        venv.join("bin").join("python"),
+        venv.join("bin").join("python3"),
+    ]
+    .into_iter()
+    .find(|p| p.exists())
+}
+
 /// Prepare llama.cpp's Hugging Face converter in an isolated HEARTH-owned
 /// environment. No global pip installs and no operator-managed clone.
 fn ensure_converter() -> Result<(std::path::PathBuf, std::path::PathBuf), String> {
@@ -510,14 +522,11 @@ fn ensure_converter() -> Result<(std::path::PathBuf, std::path::PathBuf), String
     let source = root.join("source");
     let venv = root.join("venv");
     let script = source.join("convert_hf_to_gguf.py");
-    let python = if cfg!(target_os = "windows") {
-        venv.join("Scripts").join("python.exe")
-    } else {
-        venv.join("bin").join("python")
-    };
 
-    if script.exists() && python.exists() {
-        return Ok((script, python));
+    if let Some(python) = find_venv_python(&venv) {
+        if script.exists() {
+            return Ok((script, python));
+        }
     }
 
     std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
@@ -566,34 +575,62 @@ fn ensure_converter() -> Result<(std::path::PathBuf, std::path::PathBuf), String
         let _ = std::fs::remove_file(&archive);
     }
 
-    if !python.exists() {
-        eprintln!("hearth: creating isolated GGUF conversion environment …");
-        let status = std::process::Command::new(&system_python)
-            .args(["-m", "venv"])
-            .arg(&venv)
-            .status()
-            .map_err(|e| format!("could not create converter virtualenv: {e}"))?;
-        if !status.success() {
-            return Err(format!(
-                "{system_python} -m venv failed while preparing the GGUF converter"
-            ));
+    let python = match find_venv_python(&venv) {
+        Some(python) => python,
+        None => {
+            eprintln!("hearth: creating isolated GGUF conversion environment …");
+            let status = std::process::Command::new(&system_python)
+                .args(["-m", "venv"])
+                .arg(&venv)
+                .status()
+                .map_err(|e| format!("could not create converter virtualenv: {e}"))?;
+            if !status.success() {
+                return Err(format!(
+                    "{system_python} -m venv failed while preparing the GGUF converter"
+                ));
+            }
+            find_venv_python(&venv).ok_or_else(|| {
+                format!(
+                    "virtualenv was created at {}, but no Python interpreter was found under Scripts/ or bin/",
+                    venv.display()
+                )
+            })?
         }
+    };
 
-        let reqs = source
-            .join("requirements")
-            .join("requirements-convert_hf_to_gguf.txt");
-        if !reqs.exists() {
-            return Err(format!(
-                "converter requirements not found at {}",
-                reqs.display()
-            ));
-        }
+    let reqs = source
+        .join("requirements")
+        .join("requirements-convert_hf_to_gguf.txt");
+    if !reqs.exists() {
+        return Err(format!(
+            "converter requirements not found at {}",
+            reqs.display()
+        ));
+    }
+
+    // Install dependencies only when the converter environment cannot already
+    // import its core packages. This also makes a retry after a partial setup
+    // resume cleanly instead of recreating the virtualenv.
+    let deps_ready = std::process::Command::new(&python)
+        .args(["-c", "import torch, numpy, sentencepiece"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !deps_ready {
         eprintln!("hearth: installing isolated GGUF converter dependencies …");
         let status = std::process::Command::new(&python)
             .args(["-m", "pip", "install", "-r"])
             .arg(&reqs)
             .status()
-            .map_err(|e| format!("could not install converter dependencies: {e}"))?;
+            .map_err(|e| {
+                format!(
+                    "could not install converter dependencies with {}: {e}",
+                    python.display()
+                )
+            })?;
         if !status.success() {
             return Err("installing GGUF converter dependencies failed".into());
         }
