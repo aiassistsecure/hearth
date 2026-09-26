@@ -134,11 +134,40 @@ hearth pull hf:Interchained/imagine-v8
 
 # `hearth pull` prints the materialized directory. Serve it with:
 hearth serve --model imagine-v8 --safetensors ~/.hearth/blobs/models/Interchained_imagine-v8
+
+# Or declare it in a fleet (GGUF remains the no-prefix default)
+# model muse=/models/muse.gguf:20
+# model imagine-v8=safetensors:/models/Interchained_imagine-v8:3@16384
 ```
 
 Safetensors serving expects the `vllm` CLI on PATH (or an explicit
 `--binary`). The same supervisor, health probing, causal spine, and
 OpenAI-compatible gateway remain in front of either backend.
+
+### Mixed fleets and interactive use
+
+`hearth up` accepts backend-qualified model declarations:
+
+```bash
+hearth up \
+  --model muse=gguf:/models/muse.gguf:20@16384 \
+  --model imagine-v8=safetensors:/models/Interchained_imagine-v8:3@16384
+```
+
+The `gguf:` prefix is optional for backward compatibility. Safetensors
+entries select vLLM; GGUF entries select llama.cpp. The same syntax works in
+`$HEARTH_HOME/fleet.conf` through `scripts/start.sh`.
+
+Once a fleet is running, `hearth run MODEL` opens a small interactive terminal
+against HEARTH's own `/v1/chat/completions` gateway:
+
+```bash
+hearth run imagine-v8
+```
+
+Use `/clear` to reset the conversation and `/exit` to quit. The REPL is only
+a client of the normal gateway, so residency, routing and provenance stay on
+the same hardened serving path.
 
 ## Build
 
