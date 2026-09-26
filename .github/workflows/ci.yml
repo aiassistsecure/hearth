@@ -31,6 +31,10 @@ jobs:
       - name: check bindings
         run: cargo check --workspace --all-targets
 
+      - name: live Imagine v8 safetensors resolver smoke
+        if: github.event_name == 'workflow_dispatch'
+        run: cargo test -p hearth-pull registry::tests::live_imagine_v8_resolves_as_safetensors_without_downloading_weights -- --ignored --exact --nocapture
+
       - name: fmt
         run: cargo fmt --all -- --check
 
