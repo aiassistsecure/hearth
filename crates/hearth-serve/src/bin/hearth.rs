@@ -51,10 +51,11 @@ fn main() -> ExitCode {
     let result = match args.first().map(String::as_str) {
         Some("--version") | Some("-V") => {
             println!("hearth {}", env!("CARGO_PKG_VERSION"));
-            println!("commands: up|preload|pull|serve|runtime|status|why|as-of|verify");
+            println!("commands: up|preload|pull|serve|run|runtime|status|why|as-of|verify");
             return ExitCode::SUCCESS;
         }
         Some("serve") => cmd_serve(&args[1..]),
+        Some("run") => cmd_run(&args[1..]),
         Some("status") => cmd_status(),
         Some("why") => cmd_why(&args[1..]),
         Some("as-of") => cmd_as_of(&args[1..]),
@@ -65,7 +66,7 @@ fn main() -> ExitCode {
         Some("runtime") => cmd_runtime(&args[1..]),
         _ => {
             eprintln!(
-                "usage: hearth up|preload|pull|serve|runtime|status|why|as-of|verify (see crate docs)"
+                "usage: hearth up|preload|pull|serve|run|runtime|status|why|as-of|verify (see crate docs)"
             );
             return ExitCode::from(2);
         }
@@ -289,6 +290,141 @@ fn fetch_local_json(port: u16, path: &str) -> Result<String, String> {
     raw.split_once("\r\n\r\n")
         .map(|(_, b)| b.to_string())
         .ok_or_else(|| "no body in the gateway's answer".into())
+}
+
+/// POST JSON to the local OpenAI-compatible gateway.
+fn post_local_json(port: u16, path: &str, body: &str) -> Result<String, String> {
+    use std::io::{Read, Write};
+
+    let mut s = std::net::TcpStream::connect_timeout(
+        &format!("127.0.0.1:{port}").parse().unwrap(),
+        Duration::from_secs(3),
+    )
+    .map_err(|e| format!("connect: {e}"))?;
+    let _ = s.set_read_timeout(Some(Duration::from_secs(600)));
+
+    let req = format!(
+        "POST {path} HTTP/1.1\r\nhost: 127.0.0.1:{port}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    s.write_all(req.as_bytes())
+        .map_err(|e| format!("write: {e}"))?;
+
+    let mut buf = Vec::new();
+    s.read_to_end(&mut buf)
+        .map_err(|e| format!("read: {e}"))?;
+
+    let raw = String::from_utf8_lossy(&buf);
+    let (head, body) = raw
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| "no body in the gateway's answer".to_string())?;
+    let status = head.split_whitespace().nth(1).unwrap_or("?");
+    if !status.starts_with('2') {
+        return Err(format!(
+            "gateway answered HTTP {status}: {}",
+            body.chars().take(500).collect::<String>()
+        ));
+    }
+    Ok(body.to_string())
+}
+
+/// `hearth run MODEL` — an Ollama-style interactive terminal on top of the
+/// same OpenAI-compatible gateway used by applications. The REPL is a client,
+/// not a second inference path: residency, routing and provenance remain under
+/// the normal hearth supervisor.
+fn cmd_run(args: &[String]) -> Result<(), String> {
+    use std::io::{self, BufRead};
+
+    let model = args
+        .first()
+        .filter(|s| !s.starts_with("--"))
+        .ok_or("usage: hearth run MODEL [--port N]")?
+        .clone();
+    let port: u16 = tunable(args, "--port", "HEARTH_PORT", 11434);
+
+    // Fail fast with a useful message before dropping the user into a prompt.
+    let models = fetch_local_json(port, "/v1/models").map_err(|e| {
+        format!(
+            "no hearth gateway answering on 127.0.0.1:{port} ({e}) — start the fleet with `hearth up`"
+        )
+    })?;
+    let listed: serde_json::Value =
+        serde_json::from_str(&models).map_err(|e| format!("/v1/models was not json: {e}"))?;
+    let exists = listed["data"]
+        .as_array()
+        .map(|xs| xs.iter().any(|m| m["id"].as_str() == Some(model.as_str())))
+        .unwrap_or(false);
+    if !exists {
+        return Err(format!(
+            "model {model:?} is not declared by the running fleet — check `hearth status` or GET /v1/models"
+        ));
+    }
+
+    println!("hearth run {model}");
+    println!("  /clear  clear conversation · /exit  quit");
+    println!();
+
+    let stdin = io::stdin();
+    let mut input = stdin.lock();
+    let mut messages: Vec<serde_json::Value> = Vec::new();
+
+    loop {
+        print!(">>> ");
+        std::io::stdout().flush().map_err(|e| e.to_string())?;
+
+        let mut line = String::new();
+        if input.read_line(&mut line).map_err(|e| e.to_string())? == 0 {
+            println!();
+            break;
+        }
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        match line {
+            "/exit" | "/quit" => break,
+            "/clear" => {
+                messages.clear();
+                println!("conversation cleared");
+                continue;
+            }
+            _ => {}
+        }
+
+        messages.push(serde_json::json!({
+            "role": "user",
+            "content": line
+        }));
+        let request = serde_json::json!({
+            "model": model,
+            "messages": messages,
+            "stream": false
+        });
+        let body = post_local_json(port, "/v1/chat/completions", &request.to_string())?;
+        let response: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|e| format!("gateway returned invalid json: {e}"))?;
+        if let Some(err) = response.get("error") {
+            return Err(format!("generation failed: {err}"));
+        }
+        let answer = response["choices"][0]["message"]["content"]
+            .as_str()
+            .ok_or_else(|| {
+                format!(
+                    "gateway answer had no choices[0].message.content: {}",
+                    body.chars().take(500).collect::<String>()
+                )
+            })?
+            .to_string();
+
+        println!("{answer}");
+        println!();
+        messages.push(serde_json::json!({
+            "role": "assistant",
+            "content": answer
+        }));
+    }
+
+    Ok(())
 }
 
 /// `hearth runtime` — fetch a prebuilt llama-server. No compiler, no CUDA
