@@ -49,6 +49,13 @@ use hearth_store::Spine;
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
+        Some("--version") | Some("-V") => {
+            println!("hearth {}", env!("CARGO_PKG_VERSION"));
+            println!(
+                "commands: up|preload|pull|serve|runtime|status|why|as-of|verify"
+            );
+            return ExitCode::SUCCESS;
+        }
         Some("serve") => cmd_serve(&args[1..]),
         Some("status") => cmd_status(),
         Some("why") => cmd_why(&args[1..]),
@@ -60,7 +67,7 @@ fn main() -> ExitCode {
         Some("runtime") => cmd_runtime(&args[1..]),
         _ => {
             eprintln!(
-                "usage: hearth up|preload|pull|serve|status|why|as-of|verify (see crate docs)"
+                "usage: hearth up|preload|pull|serve|runtime|status|why|as-of|verify (see crate docs)"
             );
             return ExitCode::from(2);
         }
