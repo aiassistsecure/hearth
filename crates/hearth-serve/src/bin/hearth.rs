@@ -2,6 +2,8 @@
 //!
 //!   hearth serve --model NAME (--gguf FILE | --safetensors DIR) [--port N]
 //!                [--vram-gib N] [--ctx N] [--binary PATH] [--total-gib N] [--once]
+//!   hearth up --model NAME=[gguf:|safetensors:]PATH[:GIB][@CTX] [--model …]
+//!   hearth run MODEL [--port N]
 //!   hearth status
 //!   hearth why MODEL
 //!   hearth as-of MODEL SEQ
