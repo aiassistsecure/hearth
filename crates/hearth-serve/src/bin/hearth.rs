@@ -179,6 +179,45 @@ fn warm_one(endpoint: &str, timeout: Duration) -> Result<u128, String> {
     }
 }
 
+/// Warm an OpenAI-compatible child directly. vLLM does not expose llama.cpp's
+/// /completion route, so mixed fleets use this for safetensors children.
+fn warm_one_openai(endpoint: &str, model: &str, timeout: Duration) -> Result<u128, String> {
+    use std::io::{Read, Write};
+
+    let addr: std::net::SocketAddr = endpoint
+        .parse()
+        .map_err(|e| format!("bad endpoint {endpoint}: {e}"))?;
+    let started = std::time::Instant::now();
+    let mut s = std::net::TcpStream::connect_timeout(&addr, timeout)
+        .map_err(|e| format!("connect: {e}"))?;
+    let _ = s.set_read_timeout(Some(Duration::from_secs(300)));
+    let body = serde_json::json!({
+        "model": model,
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 1,
+        "stream": false
+    })
+    .to_string();
+    let req = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nhost: {endpoint}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    s.write_all(req.as_bytes())
+        .map_err(|e| format!("write: {e}"))?;
+    let mut buf = Vec::new();
+    let _ = s.read_to_end(&mut buf);
+    let head = String::from_utf8_lossy(&buf);
+    let status: Option<u16> = head.split_whitespace().nth(1).and_then(|c| c.parse().ok());
+    if matches!(status, Some(200..=299)) {
+        Ok(started.elapsed().as_millis())
+    } else {
+        Err(format!(
+            "warmup answered {status:?}: {}",
+            head.chars().take(120).collect::<String>()
+        ))
+    }
+}
+
 /// `hearth preload NAME [NAME…] | '*'` — warm models on a RUNNING fleet.
 ///
 /// Goes through the gateway's /residency to find endpoints, then fires the
@@ -1073,6 +1112,10 @@ fn cmd_up(args: &[String]) -> Result<(), String> {
             "  preload: {} model(s) will be warmed as they turn resident",
             warm_list.len()
         );
+        let warm_backends: std::collections::HashMap<String, Backend> = specs
+            .iter()
+            .map(|s| (s.name.clone(), s.backend))
+            .collect();
         let warmer = Arc::clone(&sup);
         std::thread::spawn(move || {
             for model in warm_list {
@@ -1089,8 +1132,16 @@ fn cmd_up(args: &[String]) -> Result<(), String> {
                     };
                     match route {
                         hearth_core::fleet::Route::Ready { endpoint, .. } => {
-                            match warm_one(&endpoint, Duration::from_secs(5)) {
-                                Ok(ms) => eprintln!("hearth: warmed {model} in {ms}ms — first real request will be hot"),
+                            let result = match warm_backends.get(&model) {
+                                Some(Backend::Vllm) => {
+                                    warm_one_openai(&endpoint, &model, Duration::from_secs(5))
+                                }
+                                _ => warm_one(&endpoint, Duration::from_secs(5)),
+                            };
+                            match result {
+                                Ok(ms) => eprintln!(
+                                    "hearth: warmed {model} in {ms}ms — first real request will be hot"
+                                ),
                                 Err(e) => eprintln!("hearth: {model} warmup FAILED — {e}"),
                             }
                             break;
