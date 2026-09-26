@@ -44,12 +44,16 @@ alive() {
 write_template() {
   mkdir -p "$HEARTH_HOME"
   cat > "$CONF" <<'EOF'
-# hearth fleet — one model per line:  NAME=/absolute/path/to.gguf:GIB[@CTX]
+# hearth fleet — one model per line: NAME=[gguf:|safetensors:]PATH:GIB[@CTX]
 # Declaration order IS priority order: first fit, never best fit.
 # Lines starting with # are ignored.
 #
+# Existing GGUF syntax stays valid and uses llama.cpp:
 # model muse=/models/muse.gguf:20
-# model deepseek-r1:32b=/models/deepseek.gguf:20
+# model deepseek-r1:32b=gguf:/models/deepseek.gguf:20
+#
+# Native Hugging Face/Transformers packages use vLLM:
+# model imagine-v8=safetensors:/models/Interchained_imagine-v8:3@16384
 #
 # @CTX overrides the fleet-wide `ctx` below FOR THAT MODEL ONLY. Use it when a
 # fleet mixes context sizes: one number cannot be right for both a 1M-context
@@ -83,7 +87,7 @@ ctx 16384
 # GPU layers: -1 = all (default). 0 = CPU only — choose it, never fall into it.
 # gpu_layers -1
 
-# Extra args passed to llama-server verbatim, fleet-wide, appended LAST so
+# Extra args passed to llama-server verbatim for GGUF models, appended LAST so
 # they override hearth's defaults. Time-to-first-token knobs live here:
 #   -ub 2048           bigger physical prefill batch (default 512)
 #   --cache-reuse 256  reuse a cached KV prefix by shifting, not re-prefill
@@ -124,7 +128,7 @@ read_conf() {
       *)            die "fleet.conf: unknown directive '$1' (known: model, total_gib, port, parallel, ctx, max_inflight, gpu_layers, extra)" ;;
     esac
   done < "$CONF"
-  [ "${#MODELS[@]}" -gt 0 ] || die "no models in $CONF — add 'model NAME=/path.gguf:GIB' lines"
+  [ "${#MODELS[@]}" -gt 0 ] || die "no models in $CONF — add 'model NAME=[gguf:|safetensors:]PATH:GIB[@CTX]' lines"
 }
 
 cmd_up() {

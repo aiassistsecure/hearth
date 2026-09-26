@@ -134,11 +134,72 @@ hearth pull hf:Interchained/imagine-v8
 
 # `hearth pull` prints the materialized directory. Serve it with:
 hearth serve --model imagine-v8 --safetensors ~/.hearth/blobs/models/Interchained_imagine-v8
+
+# Or declare it in a fleet (GGUF remains the no-prefix default)
+# model muse=/models/muse.gguf:20
+# model imagine-v8=safetensors:/models/Interchained_imagine-v8:3@16384
 ```
 
 Safetensors serving expects the `vllm` CLI on PATH (or an explicit
 `--binary`). The same supervisor, health probing, causal spine, and
 OpenAI-compatible gateway remain in front of either backend.
+
+### Mixed fleets and interactive use
+
+`hearth up` accepts backend-qualified model declarations:
+
+```bash
+hearth up \
+  --model muse=gguf:/models/muse.gguf:20@16384 \
+  --model imagine-v8=safetensors:/models/Interchained_imagine-v8:3@16384
+```
+
+The `gguf:` prefix is optional for backward compatibility. Safetensors
+entries select vLLM; GGUF entries select llama.cpp. The same syntax works in
+`$HEARTH_HOME/fleet.conf` through `scripts/start.sh`.
+
+Once a fleet is running, `hearth run MODEL` opens a small interactive terminal
+against HEARTH's own `/v1/chat/completions` gateway:
+
+```bash
+hearth run imagine-v8
+```
+
+Use `/clear` to reset the conversation and `/exit` to quit. The REPL is only
+a client of the normal gateway, so residency, routing and provenance stay on
+the same hardened serving path.
+
+### Convert safetensors to GGUF
+
+`hearth convert` turns a local Transformers/safetensors package into GGUF
+without requiring a global llama.cpp source checkout or global Python packages.
+Point it at either the model directory or one of its `.safetensors` files:
+
+```bash
+hearth convert ~/.hearth/blobs/models/Interchained_imagine-v8
+hearth convert ~/.hearth/blobs/models/Interchained_imagine-v8/model.safetensors
+```
+
+Direct converter output types include `auto`, `f32`, `f16`, `bf16`,
+`q8_0`, `tq1_0`, and `tq2_0`:
+
+```bash
+hearth convert ./model --outtype f16
+```
+
+For llama.cpp quantizer formats, use `--quant`. HEARTH first creates a
+high-fidelity GGUF and then runs its managed `llama-quantize` binary:
+
+```bash
+hearth convert ./model --quant Q8_0
+hearth convert ./model --quant Q6_K
+hearth convert ./model --quant Q5_K_M
+hearth convert ./model --quant Q4_K_M
+```
+
+Use `--output FILE` to choose the final path. The converter source and Python
+environment live under `$HEARTH_HOME/runtime/converter`; quantization uses the
+llama.cpp runtime managed by `hearth runtime llama`.
 
 ## Build
 
