@@ -1,7 +1,7 @@
 //! hearth — keep declared models warm, and tell the truth about which are.
 //!
-//!   hearth serve --model NAME --gguf PATH [--port N] [--vram-gib N]
-//!                [--ctx N] [--binary PATH] [--total-gib N] [--once]
+//!   hearth serve --model NAME (--gguf FILE | --safetensors DIR) [--port N]
+//!                [--vram-gib N] [--ctx N] [--binary PATH] [--total-gib N] [--once]
 //!   hearth status
 //!   hearth why MODEL
 //!   hearth as-of MODEL SEQ
@@ -533,13 +533,21 @@ fn cmd_pull(args: &[String]) -> Result<(), String> {
         println!("{} pulled and verified — {:.2} GiB", out.model, gib);
     }
     println!("  from  {}", out.source);
-    println!("  at    {}", out.weights_path.display());
+    println!("  at    {}", out.model_path.display());
     println!();
-    println!(
-        "  hearth serve --model {} --gguf {}",
-        out.model,
-        out.weights_path.display()
-    );
+    if out.model_path.is_dir() {
+        println!(
+            "  hearth serve --model {} --safetensors {}",
+            out.model,
+            out.model_path.display()
+        );
+    } else {
+        println!(
+            "  hearth serve --model {} --gguf {}",
+            out.model,
+            out.model_path.display()
+        );
+    }
     Ok(())
 }
 
@@ -1065,7 +1073,16 @@ fn kv_bytes_for_model(gguf_path: &str, ctx_flag: u32, parallel: u32) -> u64 {
 
 fn cmd_serve(args: &[String]) -> Result<(), String> {
     let model = flag(args, "--model").ok_or("--model is required")?;
-    let gguf = flag(args, "--gguf").ok_or("--gguf is required")?;
+    let gguf = flag(args, "--gguf");
+    let safetensors = flag(args, "--safetensors");
+    let (model_path, is_safetensors) = match (gguf, safetensors) {
+        (Some(path), None) => (path, false),
+        (None, Some(path)) => (path, true),
+        (Some(_), Some(_)) => {
+            return Err("choose exactly one of --gguf FILE or --safetensors DIR".into())
+        }
+        (None, None) => return Err("one of --gguf FILE or --safetensors DIR is required".into()),
+    };
     let port: u16 = match flag(args, "--port") {
         Some(p) => p.parse().map_err(|e| format!("--port: {e}"))?,
         None => free_port()?,
@@ -1084,18 +1101,28 @@ fn cmd_serve(args: &[String]) -> Result<(), String> {
         .unwrap_or(0);
     let once = args.iter().any(|a| a == "--once");
 
-    let mut spec = ServerSpec::new(&model, &gguf, port);
+    let mut spec = if is_safetensors {
+        ServerSpec::new_safetensors(&model, &model_path, port)
+    } else {
+        ServerSpec::new(&model, &model_path, port)
+    };
     spec.ctx = ctx;
     spec.binary = match flag(args, "--binary") {
         Some(b) => b.into(),
+        None if is_safetensors => "vllm".into(),
         None => default_binary()?,
     };
     spec.log_dir = hearth_home().join("logs");
     std::fs::create_dir_all(&spec.log_dir).map_err(|e| e.to_string())?;
 
     if !runtime_available(&spec.binary) {
+        let hint = if is_safetensors {
+            "install vLLM (the `vllm` CLI) or pass --binary"
+        } else {
+            "install llama.cpp or pass --binary"
+        };
         return Err(format!(
-            "runtime not available: {} — install llama.cpp or pass --binary",
+            "runtime not available: {} — {hint}",
             spec.binary.display()
         ));
     }
@@ -1104,29 +1131,39 @@ fn cmd_serve(args: &[String]) -> Result<(), String> {
         total_bytes: total_gib * GIB,
         reserve_bytes: 2 * GIB,
     };
+    let kv_bytes = if is_safetensors {
+        // vLLM owns KV allocation for safetensors today. Weight admission is
+        // still deterministic; config-derived KV accounting is a follow-up.
+        0
+    } else {
+        kv_bytes_for_model(&model_path, ctx, spec.parallel)
+    };
     let declared = vec![Declared {
         model: model.clone(),
         weights_bytes: vram_gib * GIB,
-        kv_bytes: kv_bytes_for_model(&gguf, ctx, spec.parallel),
+        kv_bytes,
     }];
 
     install_signal_handlers();
     let mut sup = Supervisor::new(open_spine()?, budget, declared);
     sup.start(spec)?;
-    eprintln!("hearth: {model} loading on 127.0.0.1:{port} …");
+    eprintln!(
+        "hearth: {model} loading via {} on 127.0.0.1:{port} …",
+        if is_safetensors {
+            "vLLM/safetensors"
+        } else {
+            "llama.cpp/GGUF"
+        }
+    );
 
     let endpoint = sup.wait_ready(&model, Duration::from_secs(600))?;
     println!("resident {model} http://{endpoint} (OpenAI-compatible at /v1)");
 
     if once {
-        // CI's mode: supervise until resident, report, stop cleanly, exit.
         sup.stop_all();
         return Ok(());
     }
 
-    // Supervise until told to stop. Every transition lands in the spine as
-    // it happens; a SIGINT/SIGTERM records `unloaded`, reaps the child, and
-    // flushes — a kill is an event in the history, not the end of it.
     while !SHUTDOWN.load(Ordering::SeqCst) {
         std::thread::sleep(Duration::from_millis(500));
         let n = sup.tick();

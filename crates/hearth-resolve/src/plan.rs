@@ -20,6 +20,14 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// The on-disk model format selected from a catalog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelFormat {
+    Gguf,
+    SafeTensors,
+}
+
 /// One file to fetch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Blob {
@@ -38,7 +46,10 @@ pub struct FetchPlan {
     /// Stable identity — the reference's key.
     pub key: String,
     pub display_name: String,
-    /// In order. Multi-part GGUFs must be fetched and kept in sequence.
+    /// Runtime-facing model format. GGUF is a single/model-part artifact;
+    /// safetensors is a Transformers model directory with weights + metadata.
+    pub format: ModelFormat,
+    /// In order. Multi-part weights must be fetched and kept in sequence.
     pub blobs: Vec<Blob>,
     /// Which quantization we ended up with, and whether the caller chose it.
     /// Surfaced because "you asked for a model and got Q4_K_M" is information
@@ -142,6 +153,7 @@ pub fn plan_from_ollama_manifest(
     Ok(FetchPlan {
         key,
         display_name,
+        format: ModelFormat::Gguf,
         blobs,
         // Ollama tags encode the quantization in the tag itself; the manifest
         // does not name it separately, so claiming one would be inventing it.
@@ -306,6 +318,80 @@ pub fn pick_gguf(
     Ok((parts, chosen, was_chosen_for_you))
 }
 
+/// Select a complete Hugging Face safetensors package.
+///
+/// Unlike GGUF, a safetensors model is not one opaque file: Transformers
+/// needs the weight file(s) plus configuration and tokenizer metadata. We
+/// therefore return a model directory plan, not "the largest .safetensors".
+pub fn pick_safetensors(files: &[RepoFile]) -> Result<Vec<RepoFile>, ResolveError> {
+    let mut weights: Vec<RepoFile> = files
+        .iter()
+        .filter(|f| {
+            let p = f.path.to_ascii_lowercase();
+            p.ends_with(".safetensors")
+                && !p.contains("adapter")
+                && !p.contains("lora")
+                && !p.contains("optimizer")
+        })
+        .cloned()
+        .collect();
+
+    if weights.is_empty() {
+        return Err(err("no .gguf or .safetensors model weights in this repo"));
+    }
+
+    weights.sort_by(|a, b| a.path.cmp(&b.path));
+
+    // If the repo publishes a safetensors index, keep it. Sharded
+    // Transformers loaders use this to map tensor names to shard files.
+    const SUPPORT_FILES: &[&str] = &[
+        "model.safetensors.index.json",
+        "config.json",
+        "generation_config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+        "added_tokens.json",
+        "vocab.json",
+        "merges.txt",
+        "tokenizer.model",
+        "chat_template.json",
+    ];
+
+    let mut package = weights;
+    for f in files {
+        let name = f.path.rsplit('/').next().unwrap_or(&f.path);
+        if SUPPORT_FILES.contains(&name) && !package.iter().any(|p| p.path == f.path) {
+            package.push(f.clone());
+        }
+    }
+
+    package.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(package)
+}
+
+/// Pick a Hugging Face model without changing existing GGUF preference.
+///
+/// If the caller pins a quantization, that is an explicit GGUF request.
+/// Without a pin, GGUF remains preferred when present; safetensors is the
+/// fallback for native Transformers/vLLM repositories such as Imagine.
+pub fn pick_hf_model(
+    files: &[RepoFile],
+    wanted_quant: Option<&str>,
+) -> Result<(Vec<RepoFile>, ModelFormat, Option<String>, bool), ResolveError> {
+    if wanted_quant.is_some()
+        || files
+            .iter()
+            .any(|f| f.path.to_ascii_lowercase().ends_with(".gguf"))
+    {
+        let (parts, quant, chosen) = pick_gguf(files, wanted_quant)?;
+        return Ok((parts, ModelFormat::Gguf, Some(quant), chosen));
+    }
+
+    let files = pick_safetensors(files)?;
+    Ok((files, ModelFormat::SafeTensors, None, false))
+}
+
 /// Every quantization this repo appears to offer.
 pub fn available_quants(files: &[&RepoFile]) -> Vec<String> {
     let mut out: Vec<String> = files.iter().filter_map(|f| quant_of(&f.path)).collect();
@@ -439,8 +525,81 @@ pub fn plan_from_hf_files(
     FetchPlan {
         key,
         display_name,
+        format: ModelFormat::Gguf,
         blobs,
         quant: Some(quant),
         quant_was_chosen_for_you: chosen_for_you,
+    }
+}
+
+#[cfg(test)]
+mod safetensors_tests {
+    use super::*;
+
+    fn files() -> Vec<RepoFile> {
+        vec![
+            RepoFile {
+                path: "config.json".into(),
+                size_bytes: Some(100),
+            },
+            RepoFile {
+                path: "tokenizer.json".into(),
+                size_bytes: Some(200),
+            },
+            RepoFile {
+                path: "model.safetensors.index.json".into(),
+                size_bytes: Some(50),
+            },
+            RepoFile {
+                path: "model-00001-of-00002.safetensors".into(),
+                size_bytes: Some(10),
+            },
+            RepoFile {
+                path: "model-00002-of-00002.safetensors".into(),
+                size_bytes: Some(11),
+            },
+            RepoFile {
+                path: "adapter_model.safetensors".into(),
+                size_bytes: Some(1),
+            },
+            RepoFile {
+                path: "README.md".into(),
+                size_bytes: Some(1),
+            },
+        ]
+    }
+
+    #[test]
+    fn safetensors_selection_keeps_weights_and_runtime_metadata() {
+        let picked = pick_safetensors(&files()).unwrap();
+        let names: Vec<&str> = picked.iter().map(|f| f.path.as_str()).collect();
+        assert!(names.contains(&"config.json"));
+        assert!(names.contains(&"tokenizer.json"));
+        assert!(names.contains(&"model.safetensors.index.json"));
+        assert!(names.contains(&"model-00001-of-00002.safetensors"));
+        assert!(names.contains(&"model-00002-of-00002.safetensors"));
+        assert!(!names.contains(&"adapter_model.safetensors"));
+        assert!(!names.contains(&"README.md"));
+    }
+
+    #[test]
+    fn unpinned_hf_falls_back_to_safetensors_when_no_gguf_exists() {
+        let (_, format, quant, chosen) = pick_hf_model(&files(), None).unwrap();
+        assert_eq!(format, ModelFormat::SafeTensors);
+        assert_eq!(quant, None);
+        assert!(!chosen);
+    }
+
+    #[test]
+    fn gguf_still_wins_when_both_formats_exist() {
+        let mut both = files();
+        both.push(RepoFile {
+            path: "model.Q4_K_M.gguf".into(),
+            size_bytes: Some(123),
+        });
+        let (picked, format, quant, _) = pick_hf_model(&both, None).unwrap();
+        assert_eq!(format, ModelFormat::Gguf);
+        assert_eq!(quant.as_deref(), Some("Q4_K_M"));
+        assert_eq!(picked.len(), 1);
     }
 }

@@ -37,6 +37,8 @@ pub struct Blob {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fetched {
     pub blobs: Vec<Blob>,
+    /// Selected runtime-facing model format.
+    pub format: plan::ModelFormat,
     /// Total weights bytes — the number the planner wants, known before a
     /// single byte moves.
     pub weights_bytes: u64,
@@ -120,6 +122,7 @@ pub fn resolve_blobs(reference: &Reference) -> Result<Fetched, String> {
                 headers: vec![],
                 is_weights: true,
             }],
+            format: plan::ModelFormat::Gguf,
             weights_bytes: 0,
         }),
         Reference::Url { url, sha256 } => Ok(Fetched {
@@ -135,6 +138,7 @@ pub fn resolve_blobs(reference: &Reference) -> Result<Fetched, String> {
                 headers: vec![],
                 is_weights: true,
             }],
+            format: plan::ModelFormat::Gguf,
             // Unknown before the download. The planner treats an unknown
             // weight size the same way it treats any other unmeasured model:
             // it cannot refuse what it cannot size, so this pull is not
@@ -200,14 +204,18 @@ fn blobs_from_hf_listing(
         })
         .collect();
 
-    let (parts, chosen, chosen_for_you) =
-        plan::pick_gguf(&files, quant).map_err(|e| format!("{owner}/{repo}: {e}"))?;
+    let (parts, format, chosen, chosen_for_you) =
+        plan::pick_hf_model(&files, quant).map_err(|e| format!("{owner}/{repo}: {e}"))?;
 
     if chosen_for_you {
-        eprintln!(
-            "hearth: no quantization pinned for {owner}/{repo} — chose {chosen} \
-             (pin one with @{chosen} to stop seeing this)"
-        );
+        if let Some(chosen) = &chosen {
+            eprintln!(
+                "hearth: no quantization pinned for {owner}/{repo} — chose {chosen} \
+                 (pin one with @{chosen} to stop seeing this)"
+            );
+        }
+    } else if format == plan::ModelFormat::SafeTensors {
+        eprintln!("hearth: {owner}/{repo} has no GGUF — selected native safetensors package");
     }
 
     let mut blobs = Vec::with_capacity(parts.len());
@@ -218,24 +226,29 @@ fn blobs_from_hf_listing(
             .find(|e| e.path == part.path)
             .and_then(|e| e.sha256.clone());
         let size = part.size_bytes.unwrap_or(0);
-        weights_bytes = weights_bytes.saturating_add(size);
+        let lower = part.path.to_ascii_lowercase();
+        let is_weights = match format {
+            plan::ModelFormat::Gguf => lower.ends_with(".gguf"),
+            plan::ModelFormat::SafeTensors => lower.ends_with(".safetensors"),
+        };
+        if is_weights {
+            weights_bytes = weights_bytes.saturating_add(size);
+        }
         blobs.push(Blob {
-            name: part
-                .path
-                .rsplit('/')
-                .next()
-                .unwrap_or(&part.path)
-                .to_string(),
+            // Keep the repository-relative path for safetensors packages so
+            // the pull layer can materialize a valid Transformers directory.
+            name: part.path.clone(),
             url: format!("{HF_HUB}/{owner}/{repo}/resolve/{revision}/{}", part.path),
             digest,
             size_bytes: size,
             headers: vec![],
-            is_weights: true,
+            is_weights,
         });
     }
 
     Ok(Fetched {
         blobs,
+        format,
         weights_bytes,
     })
 }
@@ -353,6 +366,7 @@ pub fn blobs_from_ollama_manifest(
 
     Ok(Fetched {
         blobs,
+        format: plan::ModelFormat::Gguf,
         weights_bytes,
     })
 }
@@ -596,12 +610,31 @@ mod tests {
     }
 
     #[test]
-    fn a_repo_of_safetensors_with_no_gguf_is_refused_not_guessed() {
+    fn a_repo_of_safetensors_is_selected_as_a_native_model_package() {
         let listing = serde_json::json!([
-            { "type": "file", "path": "model.safetensors", "size": 16_000_000_000u64 }
+            { "type": "file", "path": "config.json", "size": 1024 },
+            { "type": "file", "path": "tokenizer.json", "size": 2048 },
+            {
+                "type": "file", "path": "model.safetensors", "size": 16_000_000_000u64,
+                "lfs": { "oid": "CCCC000000000000000000000000000000000000000000000000000000CCCC" }
+            }
         ]);
-        let err = blobs_from_hf_listing(&listing, "someone", "not-gguf", "main", None).unwrap_err();
-        assert!(err.contains("no .gguf"), "{err}");
+        let f =
+            blobs_from_hf_listing(&listing, "Interchained", "imagine-v8", "main", None).unwrap();
+        assert_eq!(f.format, plan::ModelFormat::SafeTensors);
+        assert_eq!(f.weights_bytes, 16_000_000_000);
+        assert!(f
+            .blobs
+            .iter()
+            .any(|b| b.name == "config.json" && !b.is_weights));
+        assert!(f
+            .blobs
+            .iter()
+            .any(|b| b.name == "tokenizer.json" && !b.is_weights));
+        assert!(f
+            .blobs
+            .iter()
+            .any(|b| b.name == "model.safetensors" && b.is_weights));
     }
 
     // ---- Reference::Url, the third source alongside Ollama and HuggingFace --

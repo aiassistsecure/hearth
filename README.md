@@ -86,7 +86,7 @@ Each package page is written for the language you land in — the API is the sam
 ## Status
 
 `hearth-core` — state machine, VRAM planner, fleet routing. Pure logic, no GPU required.
-`hearth-resolve` — one reference syntax over the Ollama registry and HuggingFace GGUFs, verified against the live registries. **Resolution only: it plans blob URLs and byte counts, and fetches nothing** — `serde` and `serde_json` are its entire dependency list.
+`hearth-resolve` — one reference syntax over the Ollama registry and HuggingFace GGUF/safetensors repositories, verified against the live registries. **Resolution only: it plans blob URLs and byte counts, and fetches nothing** — `serde` and `serde_json` are its entire dependency list.
 `hearth-store` — **the NEDB spine.** Every residency transition is a bi-temporal, causally-linked, tamper-evident event in an embedded [NEDB](https://github.com/Eth-Interchained/nedb). Not a log on the side: the supervisor's memory IS the database.
 `hearth-pull` — the downloader. Digest-verified, resumable, and every fetch recorded in the spine with its origin. Real: 637 MB from `registry.ollama.ai` in 33s, and a 64-byte corruption at offset 300M — same file size — caught by re-hashing and healed.
 `hearth-api` — the gateway. One OpenAI-compatible port routing by the `model` field, where the HTTP status carries the diagnosis: warming is a 503 with Retry-After, a reclaimed GPU is a 503 saying it was not the operator's doing, and a model that will never fit is a **409** — because a retryable status there is a router hammering a box that is arithmetically incapable of answering.
@@ -115,6 +115,30 @@ Next: HuggingFace fetch (resolve already plans it) · streaming verified against
 ## Integration
 
 hearth speaks OpenAI-compatible, so [pin-clientd](https://github.com/aiassistsecure/pin-clientd) works with it today: set `apiMode: "openai"` and point `inferenceUri` at hearth. `/residency` then adds the truth that the OpenAI shape has no way to express.
+
+## Model formats
+
+hearth keeps the inference runtime separate from residency supervision:
+
+- **GGUF** stays on `llama-server` exactly as before.
+- **Hugging Face safetensors** are pulled as a complete Transformers package
+  (weights/shards, index, config, tokenizer metadata) and served with vLLM.
+
+When a Hugging Face repository carries both GGUF and safetensors, the existing
+GGUF quantization preference remains authoritative. When it carries no GGUF,
+hearth falls back to safetensors.
+
+```bash
+# Native HF/safetensors example
+hearth pull hf:Interchained/imagine-v8
+
+# `hearth pull` prints the materialized directory. Serve it with:
+hearth serve --model imagine-v8 --safetensors ~/.hearth/blobs/models/Interchained_imagine-v8
+```
+
+Safetensors serving expects the `vllm` CLI on PATH (or an explicit
+`--binary`). The same supervisor, health probing, causal spine, and
+OpenAI-compatible gateway remain in front of either backend.
 
 ## Build
 
