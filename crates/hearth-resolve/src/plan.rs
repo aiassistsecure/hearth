@@ -534,7 +534,6 @@ pub fn plan_from_hf_files(
     }
 }
 
-
 #[cfg(test)]
 mod safetensors_tests {
     use super::*;
