@@ -523,12 +523,6 @@ fn ensure_converter() -> Result<(std::path::PathBuf, std::path::PathBuf), String
     let venv = root.join("venv");
     let script = source.join("convert_hf_to_gguf.py");
 
-    if let Some(python) = find_venv_python(&venv) {
-        if script.exists() {
-            return Ok((script, python));
-        }
-    }
-
     std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
     let system_python = converter_python()?;
 
