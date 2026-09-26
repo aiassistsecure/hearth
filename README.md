@@ -169,6 +169,38 @@ Use `/clear` to reset the conversation and `/exit` to quit. The REPL is only
 a client of the normal gateway, so residency, routing and provenance stay on
 the same hardened serving path.
 
+### Convert safetensors to GGUF
+
+`hearth convert` turns a local Transformers/safetensors package into GGUF
+without requiring a global llama.cpp source checkout or global Python packages.
+Point it at either the model directory or one of its `.safetensors` files:
+
+```bash
+hearth convert ~/.hearth/blobs/models/Interchained_imagine-v8
+hearth convert ~/.hearth/blobs/models/Interchained_imagine-v8/model.safetensors
+```
+
+Direct converter output types include `auto`, `f32`, `f16`, `bf16`,
+`q8_0`, `tq1_0`, and `tq2_0`:
+
+```bash
+hearth convert ./model --outtype f16
+```
+
+For llama.cpp quantizer formats, use `--quant`. HEARTH first creates a
+high-fidelity GGUF and then runs its managed `llama-quantize` binary:
+
+```bash
+hearth convert ./model --quant Q8_0
+hearth convert ./model --quant Q6_K
+hearth convert ./model --quant Q5_K_M
+hearth convert ./model --quant Q4_K_M
+```
+
+Use `--output FILE` to choose the final path. The converter source and Python
+environment live under `$HEARTH_HOME/runtime/converter`; quantization uses the
+llama.cpp runtime managed by `hearth runtime llama`.
+
 ## Build
 
 Every snippet in every README here is a **runnable example** — see [`examples/`](examples/README.md). The numbers in the docs were pasted out of real runs, not written by hand.
