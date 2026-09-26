@@ -130,9 +130,14 @@ pub fn runtime_dir(hearth_home: &Path) -> PathBuf {
 
 /// The llama-server inside a fetched runtime, if one has been fetched.
 pub fn fetched_server(hearth_home: &Path) -> Option<PathBuf> {
-    // Release tarballs unpack to build/bin/llama-server; we normalize to
-    // runtime/bin at extract time, and check both in case of older fetches.
-    for rel in ["bin/llama-server", "build/bin/llama-server"] {
+    // Release archives unpack to different layouts across platforms; we
+    // normalize to runtime/bin at extract time, and check legacy layouts too.
+    let names: &[&str] = if cfg!(target_os = "windows") {
+        &["bin/llama-server.exe", "build/bin/llama-server.exe"]
+    } else {
+        &["bin/llama-server", "build/bin/llama-server"]
+    };
+    for rel in names {
         let p = runtime_dir(hearth_home).join(rel);
         if p.exists() {
             return Some(p);

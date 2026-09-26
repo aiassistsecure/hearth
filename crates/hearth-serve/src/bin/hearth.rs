@@ -49,6 +49,13 @@ use hearth_store::Spine;
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
+        Some("--version") | Some("-V") => {
+            println!("hearth {}", env!("CARGO_PKG_VERSION"));
+            println!(
+                "commands: up|preload|pull|serve|runtime|status|why|as-of|verify"
+            );
+            return ExitCode::SUCCESS;
+        }
         Some("serve") => cmd_serve(&args[1..]),
         Some("status") => cmd_status(),
         Some("why") => cmd_why(&args[1..]),
@@ -60,7 +67,7 @@ fn main() -> ExitCode {
         Some("runtime") => cmd_runtime(&args[1..]),
         _ => {
             eprintln!(
-                "usage: hearth up|preload|pull|serve|status|why|as-of|verify (see crate docs)"
+                "usage: hearth up|preload|pull|serve|runtime|status|why|as-of|verify (see crate docs)"
             );
             return ExitCode::from(2);
         }
@@ -412,10 +419,11 @@ fn install_llama_runtime(args: &[String]) -> Result<(), String> {
         fetched_from = url;
     }
 
-    // 3. Extract. tar is on every box that made it this far.
+    // 3. Extract. Modern bsdtar/libarchive auto-detects both .tar.gz and .zip.
+    // Do not force gzip with -z: Windows llama.cpp releases are ZIP archives.
     let out = std::process::Command::new("tar")
         .args([
-            "-xzf",
+            "-xf",
             &archive.display().to_string(),
             "-C",
             &dir.display().to_string(),
@@ -434,9 +442,14 @@ fn install_llama_runtime(args: &[String]) -> Result<(), String> {
     //    shared libraries end up in runtime/bin. FOUND, not guessed — the
     //    first attempt hardcoded build/bin and bin, and the real b10673
     //    tarball unpacks to llama-<tag>/ with everything flat inside it.
-    let found = find_file(&dir, "llama-server", 3).ok_or_else(|| {
+    let server_name = if cfg!(target_os = "windows") {
+        "llama-server.exe"
+    } else {
+        "llama-server"
+    };
+    let found = find_file(&dir, server_name, 3).ok_or_else(|| {
         format!(
-            "the archive did not contain llama-server anywhere under {}",
+            "the archive did not contain {server_name} anywhere under {}",
             dir.display()
         )
     })?;
@@ -455,10 +468,10 @@ fn install_llama_runtime(args: &[String]) -> Result<(), String> {
         }
         let _ = std::fs::remove_dir_all(&src);
     }
-    let server = bin_dir.join("llama-server");
+    let server = bin_dir.join(server_name);
     if !server.exists() {
         return Err(format!(
-            "the archive did not contain llama-server where expected — look in {}",
+            "the archive did not contain {server_name} where expected — look in {}",
             dir.display()
         ));
     }
