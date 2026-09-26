@@ -313,7 +313,13 @@ fn download_to(dest: &Path, blob: &Blob, cfg: &PullConfig) -> Result<(), String>
 fn safe_model_dir_name(model: &str) -> String {
     model
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '.' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -331,7 +337,9 @@ fn materialize_safetensors_package(
     for (relative, source) in files {
         let rel = Path::new(relative);
         if rel.is_absolute()
-            || rel.components().any(|c| matches!(c, std::path::Component::ParentDir))
+            || rel
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
         {
             return Err(format!("refusing unsafe model path {relative:?}"));
         }
@@ -467,9 +475,7 @@ pub fn pull(reference: &str, cfg: &PullConfig, spine: &Spine) -> Result<Pulled, 
 
     let model_path = match fetched.format {
         ModelFormat::Gguf => weights_path.clone(),
-        ModelFormat::SafeTensors => {
-            materialize_safetensors_package(&model, &package_files, cfg)?
-        }
+        ModelFormat::SafeTensors => materialize_safetensors_package(&model, &package_files, cfg)?,
     };
     let bytes = if fetched.weights_bytes > 0 {
         fetched.weights_bytes
