@@ -361,7 +361,7 @@ pub fn pick_safetensors(files: &[RepoFile]) -> Result<Vec<RepoFile>, ResolveErro
     let mut package = weights;
     for f in files {
         let name = f.path.rsplit('/').next().unwrap_or(&f.path);
-        if SUPPORT_FILES.iter().any(|wanted| name == *wanted)
+        if SUPPORT_FILES.contains(&name)
             && !package.iter().any(|p| p.path == f.path)
         {
             package.push(f.clone());
