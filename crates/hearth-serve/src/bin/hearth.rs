@@ -461,9 +461,8 @@ fn install_llama_runtime(args: &[String]) -> Result<(), String> {
             }
             let to = bin_dir.join(entry.file_name());
             if to.exists() {
-                std::fs::remove_file(&to).map_err(|e| {
-                    format!("removing stale runtime file {}: {e}", to.display())
-                })?;
+                std::fs::remove_file(&to)
+                    .map_err(|e| format!("removing stale runtime file {}: {e}", to.display()))?;
             }
             std::fs::copy(entry.path(), &to).map_err(|e| {
                 format!(
