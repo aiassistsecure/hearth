@@ -51,9 +51,7 @@ fn main() -> ExitCode {
     let result = match args.first().map(String::as_str) {
         Some("--version") | Some("-V") => {
             println!("hearth {}", env!("CARGO_PKG_VERSION"));
-            println!(
-                "commands: up|preload|pull|serve|runtime|status|why|as-of|verify"
-            );
+            println!("commands: up|preload|pull|serve|runtime|status|why|as-of|verify");
             return ExitCode::SUCCESS;
         }
         Some("serve") => cmd_serve(&args[1..]),
