@@ -28,7 +28,7 @@ pub mod runtime;
 use std::path::{Path, PathBuf};
 
 use hearth_core::sha256;
-use hearth_resolve::Reference;
+use hearth_resolve::{plan::ModelFormat, Reference};
 use hearth_store::{EventRef, Spine, Transition};
 
 pub use registry::{Blob, Fetched};
@@ -64,7 +64,12 @@ pub struct Pulled {
     pub model: String,
     /// Resolved origin, as recorded in the spine.
     pub source: String,
-    /// The weights blob on disk.
+    /// Selected model format.
+    pub format: ModelFormat,
+    /// Runtime-facing path: a GGUF file or a materialized safetensors model directory.
+    pub model_path: PathBuf,
+    /// Backward-compatible primary weights path. For safetensors this is the
+    /// first weight shard; use model_path for serving.
     pub weights_path: PathBuf,
     pub bytes: u64,
     /// True when everything was already present and verified — so a second
@@ -305,6 +310,48 @@ fn download_to(dest: &Path, blob: &Blob, cfg: &PullConfig) -> Result<(), String>
     Ok(())
 }
 
+fn safe_model_dir_name(model: &str) -> String {
+    model
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '.' { c } else { '_' })
+        .collect()
+}
+
+fn materialize_safetensors_package(
+    model: &str,
+    files: &[(String, PathBuf)],
+    cfg: &PullConfig,
+) -> Result<PathBuf, String> {
+    let dir = cfg
+        .blobs_dir
+        .join("models")
+        .join(safe_model_dir_name(model));
+    std::fs::create_dir_all(&dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
+
+    for (relative, source) in files {
+        let rel = Path::new(relative);
+        if rel.is_absolute()
+            || rel.components().any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(format!("refusing unsafe model path {relative:?}"));
+        }
+        let dest = dir.join(rel);
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("creating {}: {e}", parent.display()))?;
+        }
+        if dest.exists() {
+            let _ = std::fs::remove_file(&dest);
+        }
+        if std::fs::hard_link(source, &dest).is_err() {
+            std::fs::copy(source, &dest)
+                .map_err(|e| format!("materializing {}: {e}", dest.display()))?;
+        }
+    }
+
+    Ok(dir)
+}
+
 /// Pull a model reference, recording the whole thing in the spine.
 ///
 /// The recording is not decoration. `PullStarted` goes in *before* any bytes
@@ -326,6 +373,8 @@ pub fn pull(reference: &str, cfg: &PullConfig, spine: &Spine) -> Result<Pulled, 
         return Ok(Pulled {
             model,
             source,
+            format: ModelFormat::Gguf,
+            model_path: p.clone(),
             weights_path: p,
             bytes,
             already_had_it: true,
@@ -375,8 +424,10 @@ pub fn pull(reference: &str, cfg: &PullConfig, spine: &Spine) -> Result<Pulled, 
         );
     }
 
-    let mut weights: Option<(PathBuf, u64)> = None;
+    let mut primary_weight: Option<(PathBuf, u64)> = None;
+    let mut package_files: Vec<(String, PathBuf)> = Vec::new();
     let mut cached_all = true;
+    let mut actual_weight_bytes = 0u64;
     for (i, blob) in fetched.blobs.iter().enumerate() {
         if cfg.progress {
             eprintln!(
@@ -397,12 +448,16 @@ pub fn pull(reference: &str, cfg: &PullConfig, spine: &Spine) -> Result<Pulled, 
         if !cached {
             cached_all = false;
         }
+        package_files.push((blob.name.clone(), path.clone()));
         if blob.is_weights {
-            weights = Some((path, len));
+            actual_weight_bytes = actual_weight_bytes.saturating_add(len);
+            if primary_weight.is_none() {
+                primary_weight = Some((path, len));
+            }
         }
     }
 
-    let (weights_path, bytes) = weights.ok_or_else(|| {
+    let (weights_path, first_weight_len) = primary_weight.ok_or_else(|| {
         format!(
             "{model} resolved with no weights layer — the registry returned \
              {} blob(s), none of them the model",
@@ -410,11 +465,25 @@ pub fn pull(reference: &str, cfg: &PullConfig, spine: &Spine) -> Result<Pulled, 
         )
     })?;
 
+    let model_path = match fetched.format {
+        ModelFormat::Gguf => weights_path.clone(),
+        ModelFormat::SafeTensors => {
+            materialize_safetensors_package(&model, &package_files, cfg)?
+        }
+    };
+    let bytes = if fetched.weights_bytes > 0 {
+        fetched.weights_bytes
+    } else if actual_weight_bytes > 0 {
+        actual_weight_bytes
+    } else {
+        first_weight_len
+    };
+
     spine
         .record(
             &model,
             &Transition::PullCompleted {
-                path: weights_path.display().to_string(),
+                path: model_path.display().to_string(),
                 size_bytes: bytes,
             },
             &[EventRef {
@@ -427,6 +496,8 @@ pub fn pull(reference: &str, cfg: &PullConfig, spine: &Spine) -> Result<Pulled, 
     Ok(Pulled {
         model,
         source,
+        format: fetched.format,
+        model_path,
         weights_path,
         bytes,
         already_had_it: cached_all,
@@ -714,5 +785,60 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+
+#[cfg(test)]
+mod safetensors_package_tests {
+    use super::*;
+
+    #[test]
+    fn safetensors_package_materializes_repository_paths() {
+        let root = std::env::temp_dir().join(format!("hearth-st-package-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let blobs = root.join("blobs");
+        std::fs::create_dir_all(&blobs).unwrap();
+        let a = blobs.join("a");
+        let b = blobs.join("b");
+        std::fs::write(&a, b"weights").unwrap();
+        std::fs::write(&b, b"config").unwrap();
+
+        let cfg = PullConfig {
+            blobs_dir: blobs,
+            progress: false,
+            verify_existing: false,
+        };
+        let dir = materialize_safetensors_package(
+            "Interchained/imagine-v8",
+            &[
+                ("model.safetensors".into(), a),
+                ("config.json".into(), b),
+            ],
+            &cfg,
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read(dir.join("model.safetensors")).unwrap(), b"weights");
+        assert_eq!(std::fs::read(dir.join("config.json")).unwrap(), b"config");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn safetensors_package_rejects_parent_traversal() {
+        let root = std::env::temp_dir().join(format!("hearth-st-traversal-{}", std::process::id()));
+        let blobs = root.join("blobs");
+        std::fs::create_dir_all(&blobs).unwrap();
+        let src = blobs.join("a");
+        std::fs::write(&src, b"x").unwrap();
+        let cfg = PullConfig { blobs_dir: blobs, progress: false, verify_existing: false };
+        let err = materialize_safetensors_package(
+            "m",
+            &[("../escape".into(), src)],
+            &cfg,
+        )
+        .unwrap_err();
+        assert!(err.contains("unsafe model path"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
