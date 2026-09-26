@@ -141,6 +141,41 @@ pub fn fetched_server(hearth_home: &Path) -> Option<PathBuf> {
     None
 }
 
+
+/// Where hearth keeps its isolated vLLM environment.
+pub fn vllm_dir(hearth_home: &Path) -> PathBuf {
+    runtime_dir(hearth_home).join("vllm")
+}
+
+/// The vLLM CLI inside hearth's managed virtual environment, if installed.
+pub fn fetched_vllm(hearth_home: &Path) -> Option<PathBuf> {
+    let dir = vllm_dir(hearth_home);
+    let candidates = if cfg!(target_os = "windows") {
+        vec![dir.join("Scripts").join("vllm.exe")]
+    } else {
+        vec![dir.join("bin").join("vllm")]
+    };
+    candidates.into_iter().find(|p| p.exists())
+}
+
+/// Resolve the vLLM CLI with the same operator-first policy as llama-server:
+///
+///   1. HEARTH_VLLM
+///   2. vllm on PATH
+///   3. hearth-managed isolated runtime
+pub fn resolve_vllm(hearth_home: &Path, path_has_vllm: bool) -> Resolved {
+    if let Ok(explicit) = std::env::var("HEARTH_VLLM") {
+        return Resolved::Explicit(PathBuf::from(explicit));
+    }
+    if path_has_vllm {
+        return Resolved::OnPath;
+    }
+    match fetched_vllm(hearth_home) {
+        Some(p) => Resolved::Fetched(p),
+        None => Resolved::Missing,
+    }
+}
+
 /// Which llama-server should a command use, in order of preference:
 ///
 ///   1. `HEARTH_LLAMA_SERVER` — the operator said exactly which one.
@@ -200,6 +235,7 @@ mod tests {
     fn env_guard() -> std::sync::MutexGuard<'static, ()> {
         let g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("HEARTH_LLAMA_SERVER");
+        std::env::remove_var("HEARTH_VLLM");
         g
     }
 
@@ -286,6 +322,41 @@ mod tests {
         assert_eq!(
             r,
             Resolved::Explicit(PathBuf::from("/opt/llama/llama-server"))
+        );
+    }
+
+
+    #[test]
+    fn vllm_resolution_finds_hearths_managed_environment() {
+        let _env = env_guard();
+        let dir = std::env::temp_dir().join(format!("hearth-vllm-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(resolve_vllm(&dir, false), Resolved::Missing);
+
+        let cli = if cfg!(target_os = "windows") {
+            vllm_dir(&dir).join("Scripts").join("vllm.exe")
+        } else {
+            vllm_dir(&dir).join("bin").join("vllm")
+        };
+        std::fs::create_dir_all(cli.parent().unwrap()).unwrap();
+        std::fs::write(&cli, b"x").unwrap();
+
+        assert_eq!(resolve_vllm(&dir, false), Resolved::Fetched(cli));
+        assert_eq!(resolve_vllm(&dir, true), Resolved::OnPath);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn explicit_vllm_override_beats_path_and_managed_runtime() {
+        let _env = env_guard();
+        std::env::set_var("HEARTH_VLLM", "/opt/vllm/bin/vllm");
+        let r = resolve_vllm(Path::new("/nowhere"), true);
+        std::env::remove_var("HEARTH_VLLM");
+        assert_eq!(
+            r,
+            Resolved::Explicit(PathBuf::from("/opt/vllm/bin/vllm"))
         );
     }
 }
