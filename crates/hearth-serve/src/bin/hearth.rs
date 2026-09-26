@@ -42,7 +42,7 @@ fn install_signal_handlers() {
 }
 
 use hearth_core::{Budget, Declared, GIB};
-use hearth_serve::server::{free_port, runtime_available, ServerSpec};
+use hearth_serve::server::{free_port, runtime_available, Backend, ServerSpec};
 use hearth_serve::{hearth_home, Supervisor};
 use hearth_store::Spine;
 
@@ -735,7 +735,7 @@ fn cmd_up(args: &[String]) -> Result<(), String> {
     let specs = collect_models(args)?;
     if specs.is_empty() {
         return Err(
-            "usage: hearth up --model NAME=/path/to.gguf[:GIB][@CTX] [--model …] \
+            "usage: hearth up --model NAME=[gguf:|safetensors:]PATH[:GIB][@CTX] [--model …] \
                     [--port 11434] [--total-gib 48]"
                 .into(),
         );
@@ -780,7 +780,10 @@ fn cmd_up(args: &[String]) -> Result<(), String> {
         .map(|s| Declared {
             model: s.name.clone(),
             weights_bytes: s.gib * GIB,
-            kv_bytes: kv_bytes_for_model(&s.gguf, s.ctx.unwrap_or(ctx), parallel),
+            kv_bytes: match s.backend {
+                Backend::LlamaCpp => kv_bytes_for_model(&s.path, s.ctx.unwrap_or(ctx), parallel),
+                Backend::Vllm => 0,
+            },
         })
         .collect();
 
@@ -795,26 +798,34 @@ fn cmd_up(args: &[String]) -> Result<(), String> {
     for ms in &specs {
         let name = &ms.name;
         let port = free_port()?;
-        let mut spec = ServerSpec::new(name, &ms.gguf, port);
+        let mut spec = match ms.backend {
+            Backend::LlamaCpp => ServerSpec::new(name, &ms.path, port),
+            Backend::Vllm => ServerSpec::new_safetensors(name, &ms.path, port),
+        };
         spec.ctx = ms.ctx.unwrap_or(ctx);
-        spec.parallel = parallel;
-        spec.gpu_layers = gpu_layers;
-        spec.mlock = mlock;
-        // Operator's runtime args, verbatim and last, so they can override any
-        // default argv() emits. Fleet-wide: one llama-server flag set for every
-        // child, the same way ctx/parallel are.
-        spec.extra_args = passthrough.to_vec();
+        if ms.backend == Backend::LlamaCpp {
+            spec.parallel = parallel;
+            spec.gpu_layers = gpu_layers;
+            spec.mlock = mlock;
+            // `extra` remains llama.cpp-specific. Passing llama flags to
+            // vLLM would turn a mixed fleet into a runtime argument failure.
+            spec.extra_args = passthrough.to_vec();
+        }
         spec.binary = match flag(args, "--binary") {
             Some(b) => b.into(),
-            None => default_binary()?,
+            None => match ms.backend {
+                Backend::LlamaCpp => default_binary()?,
+                Backend::Vllm => default_vllm_binary()?,
+            },
         };
         spec.log_dir = log_dir.clone();
-        if let Some(b) = flag(args, "--binary") {
-            spec.binary = b.into();
-        }
         if !runtime_available(&spec.binary) {
+            let hint = match ms.backend {
+                Backend::LlamaCpp => "run `hearth runtime llama` or pass --binary",
+                Backend::Vllm => "run `hearth runtime vllm` or pass --binary",
+            };
             return Err(format!(
-                "runtime not available: {} — install llama.cpp or pass --binary",
+                "runtime not available: {} — {hint}",
                 spec.binary.display()
             ));
         }
@@ -827,13 +838,21 @@ fn cmd_up(args: &[String]) -> Result<(), String> {
             Ok(()) => {
                 let ctx_note = if eff_ctx == 0 {
                     "ctx runtime default".to_string()
-                } else {
+                } else if ms.backend == Backend::LlamaCpp {
                     format!(
                         "ctx {eff_ctx} across {parallel} slot(s) = {}/request",
                         eff_ctx / parallel.max(1)
                     )
+                } else {
+                    format!("ctx {eff_ctx} · vLLM batching")
                 };
-                eprintln!("hearth: {name} loading on 127.0.0.1:{port} — {ctx_note} …");
+                let backend = match ms.backend {
+                    Backend::LlamaCpp => "llama.cpp/GGUF",
+                    Backend::Vllm => "vLLM/safetensors",
+                };
+                eprintln!(
+                    "hearth: {name} loading via {backend} on 127.0.0.1:{port} — {ctx_note} …"
+                );
             }
             // A refusal is not a crash. Say it and keep going: the rest of the
             // fleet is still worth serving.
@@ -1109,7 +1128,8 @@ fn cmd_up(args: &[String]) -> Result<(), String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ModelSpec {
     name: String,
-    gguf: String,
+    path: String,
+    backend: Backend,
     gib: u64,
     /// `None` inherits the fleet-wide `--ctx`.
     ctx: Option<u32>,
@@ -1133,10 +1153,19 @@ fn collect_models(args: &[String]) -> Result<Vec<ModelSpec>, String> {
         if args[i] == "--model" {
             let spec = args
                 .get(i + 1)
-                .ok_or("--model needs NAME=/path/to.gguf[:GIB][@CTX]")?;
+                .ok_or("--model needs NAME=[gguf:|safetensors:]PATH[:GIB][@CTX]")?;
             let (name, rest) = spec.split_once('=').ok_or_else(|| {
-                format!("--model {spec}: expected NAME=/path/to.gguf[:GIB][@CTX]")
+                format!("--model {spec}: expected NAME=[gguf:|safetensors:]PATH[:GIB][@CTX]")
             })?;
+            // Explicit backend prefixes are optional. No prefix keeps the
+            // historical GGUF meaning, including Windows paths such as C:\\models\\m.gguf.
+            let (backend, rest) = if let Some(path) = rest.strip_prefix("safetensors:") {
+                (Backend::Vllm, path)
+            } else if let Some(path) = rest.strip_prefix("gguf:") {
+                (Backend::LlamaCpp, path)
+            } else {
+                (Backend::LlamaCpp, rest)
+            };
             // Context first, off the right: it is the only field introduced by
             // '@', so taking it before the size keeps the size parsing below
             // byte-for-byte what it was.
@@ -1172,7 +1201,8 @@ fn collect_models(args: &[String]) -> Result<Vec<ModelSpec>, String> {
             }
             out.push(ModelSpec {
                 name: name.to_string(),
-                gguf: path.to_string(),
+                path: path.to_string(),
+                backend,
                 gib,
                 ctx,
             });
@@ -1499,7 +1529,7 @@ mod model_spec_tests {
             out[0].name, "gpt-oss:20b",
             "a colon in the NAME is not a size"
         );
-        assert_eq!(out[0].gguf, "/blobs/sha256-27cd");
+        assert_eq!(out[0].path, "/blobs/sha256-27cd");
         assert_eq!(out[0].gib, 12);
         assert_eq!(out[0].ctx, Some(32768));
     }
@@ -1521,7 +1551,7 @@ mod model_spec_tests {
     #[test]
     fn ctx_without_a_size_works_and_the_size_defaults() {
         let out = m("small=/blobs/sha256-aaa@8192");
-        assert_eq!(out[0].gguf, "/blobs/sha256-aaa");
+        assert_eq!(out[0].path, "/blobs/sha256-aaa");
         assert_eq!(out[0].gib, 4, "documented default when :GIB is absent");
         assert_eq!(out[0].ctx, Some(8192));
     }
@@ -1529,7 +1559,7 @@ mod model_spec_tests {
     #[test]
     fn a_windows_drive_colon_is_still_not_a_size() {
         let out = m(r"win=C:\models\m.gguf:20@16384");
-        assert_eq!(out[0].gguf, r"C:\models\m.gguf");
+        assert_eq!(out[0].path, r"C:\models\m.gguf");
         assert_eq!(out[0].gib, 20);
         assert_eq!(out[0].ctx, Some(16384));
     }
