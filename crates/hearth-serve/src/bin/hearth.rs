@@ -4,6 +4,7 @@
 //!                [--vram-gib N] [--ctx N] [--binary PATH] [--total-gib N] [--once]
 //!   hearth up --model NAME=[gguf:|safetensors:]PATH[:GIB][@CTX] [--model …]
 //!   hearth run MODEL [--port N]
+//!   hearth convert INPUT [--output FILE] [--outtype TYPE] [--quant TYPE]
 //!   hearth status
 //!   hearth why MODEL
 //!   hearth as-of MODEL SEQ
@@ -53,7 +54,7 @@ fn main() -> ExitCode {
     let result = match args.first().map(String::as_str) {
         Some("--version") | Some("-V") => {
             println!("hearth {}", env!("CARGO_PKG_VERSION"));
-            println!("commands: up|preload|pull|serve|run|runtime|status|why|as-of|verify");
+            println!("commands: up|preload|pull|convert|serve|run|runtime|status|why|as-of|verify");
             return ExitCode::SUCCESS;
         }
         Some("serve") => cmd_serve(&args[1..]),
@@ -63,12 +64,13 @@ fn main() -> ExitCode {
         Some("as-of") => cmd_as_of(&args[1..]),
         Some("verify") => cmd_verify(),
         Some("pull") => cmd_pull(&args[1..]),
+        Some("convert") => cmd_convert(&args[1..]),
         Some("up") => cmd_up(&args[1..]),
         Some("preload") => cmd_preload(&args[1..]),
         Some("runtime") => cmd_runtime(&args[1..]),
         _ => {
             eprintln!(
-                "usage: hearth up|preload|pull|serve|run|runtime|status|why|as-of|verify (see crate docs)"
+                "usage: hearth up|preload|pull|convert|serve|run|runtime|status|why|as-of|verify (see crate docs)"
             );
             return ExitCode::from(2);
         }
@@ -465,6 +467,341 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
         }));
     }
 
+    Ok(())
+}
+
+/// Locate a working Python interpreter for HEARTH-managed conversion.
+fn converter_python() -> Result<String, String> {
+    ["python3", "python"]
+        .into_iter()
+        .find(|name| {
+            std::process::Command::new(name)
+                .arg("--version")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        })
+        .map(str::to_string)
+        .ok_or_else(|| "Python 3 is required for safetensors → GGUF conversion".into())
+}
+
+fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if from.is_dir() {
+            copy_dir_recursive(&from, &to)?;
+        } else {
+            std::fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
+/// Prepare llama.cpp's Hugging Face converter in an isolated HEARTH-owned
+/// environment. No global pip installs and no operator-managed clone.
+fn ensure_converter() -> Result<(std::path::PathBuf, std::path::PathBuf), String> {
+    let home = hearth_home();
+    let root = hearth_pull::runtime::runtime_dir(&home).join("converter");
+    let source = root.join("source");
+    let venv = root.join("venv");
+    let script = source.join("convert_hf_to_gguf.py");
+    let python = if cfg!(target_os = "windows") {
+        venv.join("Scripts").join("python.exe")
+    } else {
+        venv.join("bin").join("python")
+    };
+
+    if script.exists() && python.exists() {
+        return Ok((script, python));
+    }
+
+    std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+    let system_python = converter_python()?;
+
+    if !script.exists() {
+        let tag = latest_llama_tag()?;
+        let archive = root.join(format!("llama.cpp-{tag}.tar.gz"));
+        let url = format!(
+            "https://github.com/ggml-org/llama.cpp/archive/refs/tags/{tag}.tar.gz"
+        );
+        eprintln!("hearth: fetching llama.cpp converter {tag} …");
+        let req = hearth_pull::curl::Request::get(&url).to_file(&archive);
+        hearth_pull::curl::fetch_file(&req, true).map_err(|e| e.0)?;
+
+        let unpack = root.join("unpack");
+        let _ = std::fs::remove_dir_all(&unpack);
+        std::fs::create_dir_all(&unpack).map_err(|e| e.to_string())?;
+        let out = std::process::Command::new("tar")
+            .args([
+                "-xf",
+                &archive.display().to_string(),
+                "-C",
+                &unpack.display().to_string(),
+            ])
+            .output()
+            .map_err(|e| format!("could not run tar for converter source: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "extracting converter source: {}",
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+
+        let extracted = std::fs::read_dir(&unpack)
+            .map_err(|e| e.to_string())?
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .find(|p| p.is_dir() && p.join("convert_hf_to_gguf.py").exists())
+            .ok_or("llama.cpp source archive did not contain convert_hf_to_gguf.py")?;
+        let _ = std::fs::remove_dir_all(&source);
+        if std::fs::rename(&extracted, &source).is_err() {
+            copy_dir_recursive(&extracted, &source)
+                .map_err(|e| format!("installing converter source: {e}"))?;
+            let _ = std::fs::remove_dir_all(&extracted);
+        }
+        let _ = std::fs::remove_dir_all(&unpack);
+        let _ = std::fs::remove_file(&archive);
+    }
+
+    if !python.exists() {
+        eprintln!("hearth: creating isolated GGUF conversion environment …");
+        let status = std::process::Command::new(&system_python)
+            .args(["-m", "venv"])
+            .arg(&venv)
+            .status()
+            .map_err(|e| format!("could not create converter virtualenv: {e}"))?;
+        if !status.success() {
+            return Err(format!(
+                "{system_python} -m venv failed while preparing the GGUF converter"
+            ));
+        }
+
+        let reqs = source
+            .join("requirements")
+            .join("requirements-convert_hf_to_gguf.txt");
+        if !reqs.exists() {
+            return Err(format!(
+                "converter requirements not found at {}",
+                reqs.display()
+            ));
+        }
+        eprintln!("hearth: installing isolated GGUF converter dependencies …");
+        let status = std::process::Command::new(&python)
+            .args(["-m", "pip", "install", "-r"])
+            .arg(&reqs)
+            .status()
+            .map_err(|e| format!("could not install converter dependencies: {e}"))?;
+        if !status.success() {
+            return Err("installing GGUF converter dependencies failed".into());
+        }
+    }
+
+    if !script.exists() || !python.exists() {
+        return Err("GGUF converter setup completed without a usable toolchain".into());
+    }
+    Ok((script, python))
+}
+
+fn managed_quantizer() -> Option<std::path::PathBuf> {
+    let dir = hearth_pull::runtime::runtime_dir(&hearth_home());
+    let name = if cfg!(target_os = "windows") {
+        "llama-quantize.exe"
+    } else {
+        "llama-quantize"
+    };
+    find_file(&dir, name, 4)
+}
+
+/// `hearth convert INPUT [--output FILE] [--outtype TYPE] [--quant TYPE]`
+///
+/// INPUT may be a local Transformers directory or one of its .safetensors
+/// files. File input is normalized to its parent because conversion also needs
+/// config/tokenizer metadata.
+///
+/// `--outtype` controls direct conversion (auto/f32/f16/bf16/q8_0/tq1_0/tq2_0).
+/// `--quant` adds a second llama-quantize stage and accepts the quantizer's
+/// native names, e.g. Q8_0, Q6_K, Q5_K_M, Q4_K_M.
+fn cmd_convert(args: &[String]) -> Result<(), String> {
+    let input = args
+        .first()
+        .filter(|s| !s.starts_with("--"))
+        .ok_or(
+            "usage: hearth convert INPUT [--output FILE] [--outtype TYPE] [--quant TYPE]",
+        )?;
+    let input_path = std::path::PathBuf::from(input);
+    if !input_path.exists() {
+        return Err(format!("input does not exist: {}", input_path.display()));
+    }
+
+    let model_dir = if input_path.is_dir() {
+        input_path.clone()
+    } else if input_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("safetensors"))
+        .unwrap_or(false)
+    {
+        input_path
+            .parent()
+            .ok_or("safetensors input has no parent model directory")?
+            .to_path_buf()
+    } else {
+        return Err(
+            "INPUT must be a Transformers model directory or a .safetensors file".into(),
+        );
+    };
+
+    let config = model_dir.join("config.json");
+    if !config.exists() {
+        return Err(format!(
+            "{} is not a complete Transformers package: config.json is missing",
+            model_dir.display()
+        ));
+    }
+    let has_weights = std::fs::read_dir(&model_dir)
+        .map_err(|e| format!("reading {}: {e}", model_dir.display()))?
+        .filter_map(Result::ok)
+        .any(|e| {
+            e.path()
+                .extension()
+                .and_then(|x| x.to_str())
+                .map(|x| x.eq_ignore_ascii_case("safetensors"))
+                .unwrap_or(false)
+        });
+    if !has_weights {
+        return Err(format!(
+            "{} contains no .safetensors weights",
+            model_dir.display()
+        ));
+    }
+
+    let requested_outtype = flag(args, "--outtype").unwrap_or_else(|| "auto".into());
+    if !matches!(
+        requested_outtype.as_str(),
+        "auto" | "f32" | "f16" | "bf16" | "q8_0" | "tq1_0" | "tq2_0"
+    ) {
+        return Err(format!("unsupported --outtype {requested_outtype:?}"));
+    }
+
+    let quant = flag(args, "--quant").map(|q| q.to_ascii_uppercase());
+    if quant.is_some()
+        && matches!(
+            requested_outtype.as_str(),
+            "q8_0" | "tq1_0" | "tq2_0"
+        )
+    {
+        return Err(
+            "--quant should start from auto/f32/f16/bf16, not an already quantized --outtype"
+                .into(),
+        );
+    }
+
+    let base_name = model_dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("model");
+
+    let output = match flag(args, "--output").or_else(|| flag(args, "--outfile")) {
+        Some(p) => std::path::PathBuf::from(p),
+        None => {
+            let suffix = quant
+                .as_deref()
+                .unwrap_or(requested_outtype.as_str())
+                .to_ascii_lowercase();
+            model_dir.join(format!("{base_name}-{suffix}.gguf"))
+        }
+    };
+    if let Some(parent) = output.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("creating output directory {}: {e}", parent.display()))?;
+    }
+
+    let (script, python) = ensure_converter()?;
+
+    // Quantization is intentionally two-stage. llama-quantize expects a
+    // high-fidelity GGUF input; quantizing an already quantized GGUF compounds
+    // loss and is therefore rejected above.
+    let base_output = if quant.is_some() {
+        output.with_file_name(format!("{base_name}-hearth-base-{requested_outtype}.gguf"))
+    } else {
+        output.clone()
+    };
+
+    eprintln!(
+        "hearth: converting {} → {} ({requested_outtype}) …",
+        model_dir.display(),
+        base_output.display()
+    );
+    let status = std::process::Command::new(&python)
+        .arg(&script)
+        .arg(&model_dir)
+        .arg("--outfile")
+        .arg(&base_output)
+        .arg("--outtype")
+        .arg(&requested_outtype)
+        .status()
+        .map_err(|e| format!("could not launch GGUF converter: {e}"))?;
+    if !status.success() {
+        return Err(format!(
+            "GGUF conversion failed with exit code {:?}",
+            status.code()
+        ));
+    }
+    if !base_output.exists() {
+        return Err(format!(
+            "converter exited successfully but {} was not created",
+            base_output.display()
+        ));
+    }
+
+    if let Some(quant) = quant {
+        let quantizer = managed_quantizer().ok_or(
+            "llama-quantize is not installed in HEARTH's managed llama.cpp runtime — run `hearth runtime llama` first",
+        )?;
+        eprintln!(
+            "hearth: quantizing {} → {} ({quant}) …",
+            base_output.display(),
+            output.display()
+        );
+        let status = std::process::Command::new(&quantizer)
+            .arg(&base_output)
+            .arg(&output)
+            .arg(&quant)
+            .status()
+            .map_err(|e| format!("could not launch {}: {e}", quantizer.display()))?;
+        if !status.success() {
+            return Err(format!(
+                "GGUF quantization {quant} failed with exit code {:?}",
+                status.code()
+            ));
+        }
+        let _ = std::fs::remove_file(&base_output);
+    }
+
+    if !output.exists() {
+        return Err(format!("{} was not created", output.display()));
+    }
+    let bytes = std::fs::metadata(&output)
+        .map_err(|e| format!("reading output metadata: {e}"))?
+        .len();
+    println!(
+        "converted {} → {} ({:.2} GiB)",
+        model_dir.display(),
+        output.display(),
+        bytes as f64 / GIB as f64
+    );
+    println!(
+        "  hearth serve --model {} --gguf {}",
+        base_name,
+        output.display()
+    );
     Ok(())
 }
 
