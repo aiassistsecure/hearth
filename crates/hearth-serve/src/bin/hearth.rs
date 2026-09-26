@@ -1081,9 +1081,7 @@ fn cmd_serve(args: &[String]) -> Result<(), String> {
         (Some(_), Some(_)) => {
             return Err("choose exactly one of --gguf FILE or --safetensors DIR".into())
         }
-        (None, None) => {
-            return Err("one of --gguf FILE or --safetensors DIR is required".into())
-        }
+        (None, None) => return Err("one of --gguf FILE or --safetensors DIR is required".into()),
     };
     let port: u16 = match flag(args, "--port") {
         Some(p) => p.parse().map_err(|e| format!("--port: {e}"))?,
@@ -1151,7 +1149,11 @@ fn cmd_serve(args: &[String]) -> Result<(), String> {
     sup.start(spec)?;
     eprintln!(
         "hearth: {model} loading via {} on 127.0.0.1:{port} …",
-        if is_safetensors { "vLLM/safetensors" } else { "llama.cpp/GGUF" }
+        if is_safetensors {
+            "vLLM/safetensors"
+        } else {
+            "llama.cpp/GGUF"
+        }
     );
 
     let endpoint = sup.wait_ready(&model, Duration::from_secs(600))?;
