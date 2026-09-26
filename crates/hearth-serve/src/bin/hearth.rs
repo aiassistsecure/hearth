@@ -526,9 +526,7 @@ fn ensure_converter() -> Result<(std::path::PathBuf, std::path::PathBuf), String
     if !script.exists() {
         let tag = latest_llama_tag()?;
         let archive = root.join(format!("llama.cpp-{tag}.tar.gz"));
-        let url = format!(
-            "https://github.com/ggml-org/llama.cpp/archive/refs/tags/{tag}.tar.gz"
-        );
+        let url = format!("https://github.com/ggml-org/llama.cpp/archive/refs/tags/{tag}.tar.gz");
         eprintln!("hearth: fetching llama.cpp converter {tag} …");
         let req = hearth_pull::curl::Request::get(&url).to_file(&archive);
         hearth_pull::curl::fetch_file(&req, true).map_err(|e| e.0)?;
@@ -630,9 +628,7 @@ fn cmd_convert(args: &[String]) -> Result<(), String> {
     let input = args
         .first()
         .filter(|s| !s.starts_with("--"))
-        .ok_or(
-            "usage: hearth convert INPUT [--output FILE] [--outtype TYPE] [--quant TYPE]",
-        )?;
+        .ok_or("usage: hearth convert INPUT [--output FILE] [--outtype TYPE] [--quant TYPE]")?;
     let input_path = std::path::PathBuf::from(input);
     if !input_path.exists() {
         return Err(format!("input does not exist: {}", input_path.display()));
@@ -651,9 +647,7 @@ fn cmd_convert(args: &[String]) -> Result<(), String> {
             .ok_or("safetensors input has no parent model directory")?
             .to_path_buf()
     } else {
-        return Err(
-            "INPUT must be a Transformers model directory or a .safetensors file".into(),
-        );
+        return Err("INPUT must be a Transformers model directory or a .safetensors file".into());
     };
 
     let config = model_dir.join("config.json");
@@ -689,12 +683,7 @@ fn cmd_convert(args: &[String]) -> Result<(), String> {
     }
 
     let quant = flag(args, "--quant").map(|q| q.to_ascii_uppercase());
-    if quant.is_some()
-        && matches!(
-            requested_outtype.as_str(),
-            "q8_0" | "tq1_0" | "tq2_0"
-        )
-    {
+    if quant.is_some() && matches!(requested_outtype.as_str(), "q8_0" | "tq1_0" | "tq2_0") {
         return Err(
             "--quant should start from auto/f32/f16/bf16, not an already quantized --outtype"
                 .into(),
